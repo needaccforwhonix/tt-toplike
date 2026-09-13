@@ -4,6 +4,92 @@
 
 This document tracks the development of tt-toplike-rs, a Rust implementation of tt-top (Python) for real-time Tenstorrent hardware monitoring.
 
+Binaries: `tt-toplike` (dispatcher), `tt-toplike-tui`, `tt-toplike-app`/`tt-toplike-egui` (egui GUI).
+
+> **Agent guidance lives in this file.** This project uses `AGENTS.md` (not a
+> separate `CLAUDE.md`) as the single source of project notes, conventions, and
+> the development log.
+
+---
+
+## Build & test gotchas (current)
+
+* A `build-deb.sh` run leaves an **untracked** `.cargo/config.toml` + partial
+  `vendor/` in the tree that redirects all crate lookups to `vendor/` for
+  network-free dpkg builds. That vendor set is incomplete (missing
+  `all-smi-luwen-*` and most deps), so a normal `cargo build` fails with
+  *"no matching package named `all-smi-luwen-core`"*. Move `.cargo/config.toml`
+  aside to build/test against the real registry cache, then restore it.
+* After `cargo build --release`, copy every shipped binary into `~/.local/bin`
+  (`cp target/release/tt-toplike{,-tui} ~/.local/bin/`) or a stale one already
+  on `$PATH` shadows it. `install.sh` handles `tt-toplike-tui`/`tt-toplike-egui`
+  via `cargo install` but not the `tt-toplike` dispatcher — copy that by hand.
+* `all-smi-luwen-*` crates are **optional**, gated behind the `luwen-backend`
+  feature — default builds don't need them.
+* Adding a field to `ServiceState` / `TickSample` / `RemoteInference` is a
+  compile error at **every** struct literal, including test-only ones — update
+  all enumerated sites (the test build is where a missing field bites).
+* TUI convention: **left-side and bottom borders only, never right-side border
+  characters** (`╔`/`║`/`╚`) — variable-width box glyphs wrap when the terminal
+  is even one column narrower than expected. Panels/overlays must size to their
+  widest content in real display columns (unicode-width), never clip.
+
+---
+
+## July 2026 — legend/sidebar truncation + SkyReels media/diffusion monitoring (v0.7.31–0.7.33)
+
+Prompt: "the text in our legends (and other little sidebars) keeps getting
+truncated!" — plus a follow-up that `[i]` inference mode showed nothing for a
+SkyReels model.
+
+* **Legend/overlay truncation (v0.7.31).** `render_overlay_panel` (legend / help
+  / explain overlay in `src/ui/tui/mod.rs`) hardcoded `PANEL_W = 42`, but content
+  lines run 50–66 display columns. `Paragraph` clips (doesn't wrap), so every long
+  line lost its tail (e.g. the `/serve` help line dropped "(plaintext,
+  trusted-LAN)"). Now the panel measures its widest content line in real display
+  columns (new `line_cols` helper via `unicode-width`, matching `arcade.rs`) and
+  sizes itself to fit, clamped to the terminal. Regression test:
+  `overlay_panel_does_not_truncate_wide_content`. The kill-confirm dialog
+  (`render_kill_dialog`, also 42-wide) is fine — it deliberately truncates the
+  process name to 14 chars.
+
+* **SkyReels / media-server metrics (v0.7.32 initial cut, corrected in v0.7.33).**
+  The metrics layer only parsed the `vllm:` namespace, so diffusion/video servers
+  (**tt-media-inference-server**: SkyReels, SDXL, z-image) showed a blank `[i]`
+  panel — they expose a *different* namespace, `tt_media_server_*`, on the same
+  `/metrics` endpoint the monitor already scrapes, and tokens/sec is meaningless
+  for diffusion anyway. Added `parse_media_metrics` + `MediaCounters`/`MediaStats`
+  (+ `fold`) in `metrics.rs`; `ServiceState.media: Option<MediaStats>`, folded in
+  `monitor.rs` alongside `serving` (mutually exclusive — a scrape carries one
+  namespace or the other); reused the Feeding snake (`serving_creature.rs`) via a
+  workload-agnostic `CreatureDrive` (headline generations/min + seconds-per-gen;
+  the LLM path is byte-for-byte unchanged, and swimlanes are gated to vLLM so a
+  diffusion box never draws empty "requests" lanes). Remote wire: `RemoteMedia` on
+  `RemoteInference` (`#[serde(default)]` for back-compat), mapped both directions.
+
+* **Metric names corrected against a LIVE server (v0.7.33).** The 0.7.32 parser
+  used doc-derived names that don't exist on the real
+  `tt-media-inference-server:0.15.0` — so a live SkyReels box showed nothing when
+  load was sent. Curled the real `:8000/metrics` and fixed against ground truth:
+  - Real signals: `tt_media_server_requests_base_total` (completed),
+    **`tt_media_server_jobs_in_progress`** (in-flight gauge — the "acking" signal
+    that was missing), `tt_media_server_requests_base_duration_seconds_total`
+    histogram (end-to-end per-gen wall time), `tt_media_server_post_processing_*`.
+    The doc names `model_inference_total`/`pre_processing`/`device_warmup` are
+    NOT emitted (parsed best-effort, shown only if non-zero).
+  - **Duplicate-series gotcha:** that build (prometheus multiprocess) emits every
+    series *twice*, byte-identical. The summing parser doubled everything → now
+    dedupes by `name{labels}` identity while still summing distinct label sets.
+  - `jobs_in_progress` drives the snake body length + keeps it animated while
+    work is in flight (rate/completions are rare — a clip takes minutes). Panel
+    leads with "in flight N"; roster shows "N in flight · M done".
+  - Live readiness: `/health`→200 `{}`, `/tt-liveness`→`model_ready:true` +
+    `queue_size` + `runner_in_use`; generic tracking uses `/health` (200→Ready).
+  - Verified end-to-end: real full `/metrics` → `requests_total=1,
+    jobs_in_progress=2, duration=612s` (no doubling).
+  - ⚠️ Metric shape is version-specific; re-curl `/metrics` when the server image
+    changes.
+
 ---
 
 ## Phase 21: Hardware Plurality — Single-Chip Cards + Multi-Distro .deb (April 29, 2026)
@@ -3769,3 +3855,1484 @@ The Arcade mode achieves the rare combination of **aesthetic delight** and **inf
 *Last Updated: March 19, 2026*
 *Phase: Arcade Mode - Unified Psychedelic Visualization Complete ✅ (17/17 phases done)*
 *Status: **Production Ready** - Unified visualization with hero character and improved contrast*
+
+---
+
+## Phase 22: Inference Server Monitor (planned — 2026-07-02)
+
+**Origin:** Taylor hit a real pain point waiting for Z-Image-Turbo (first-run TTNN kernel compilation on P150X4) to become ready. The server log goes silent for 90+ minutes during weight loading with no signal of progress — only a heartbeat of `405 Method Not Allowed` liveness polls. He wants tt-toplike to fill that gap.
+
+**Goal:** Add a live inference server panel alongside the existing chip telemetry so operators can see _what phase_ a model is in (compiling kernels / loading weights / ready / failed) and get concrete evidence of progress rather than just watching a clock.
+
+### What to instrument
+
+**Phase detection** — determined by combining signals:
+- `g++` process alive inside container → kernel compilation phase
+- `g++` gone, Python alive, RSS growing → weight loading phase
+- liveness endpoint returns 200 → ready
+- RSS flat + g++ gone + no 200 for 5+ min → alarm (possible hang/OOM)
+
+**Metrics to surface:**
+- Container CPU % and RSS (from `docker stats`)
+- `.o` file count in TTNN cache dir inside container (proxy for compile progress; needs `docker exec find … | wc -l` or Docker API)
+- RSS delta per tick (weight loading rate in GB/min)
+- Liveness endpoint status (000 / 405 / 200)
+- Top process name inside container (`docker exec ps aux`)
+- Server log tail (last non-health-check line)
+
+**Heartbeat indicator:** flag any tick where _nothing changed_ (RSS flat, .o count flat, same top process) as a warning — real work always moves at least one of these needles.
+
+**"% complete" estimate:**
+- Compile phase: `.o` count / baseline (profile a completed run once, hardcode per model)
+- Load phase: RSS delta / total model size (model disk footprint is known)
+
+### Existing art / prior work
+- `tt-forge-compiletron` (`~/code/tt-forge-compiletron`) — Textual TUI with per-chip compile queue and live progress; good inspiration
+- `ttnn-visualizer` — post-hoc analysis, not live
+- `nvtop` — real-time chip utilization, no inference-server awareness
+- No tool currently watches kernel compilation progress or model loading in real time (confirmed via Glean/Confluence search July 2026)
+
+### Integration notes
+- Docker access: shell out to `docker stats --no-stream` and `docker exec` — no daemon socket needed
+- Service list: mirror the `SERVERS` dict from `tt-local-generator/app/server_manager.py` (or read a config file); the services are wan2.2, motif, flux, skyreels, z-image-turbo, animate, prompt-server
+- Liveness URL: `http://localhost:{port}/tt-liveness` — port per service (all currently 8000 except prompt-server on 8001)
+- The panel should work even when no container is running (show "no server" state gracefully)
+
+### Suggested UI layout (new panel, toggled with a key)
+
+```
+╔══════════════════════════════════════════════════════
+║  Inference Server                   [i] to toggle
+║  Container: tt-inference-server-1702dd1a  Up 2h
+║
+║  Model:     Z-Image-Turbo (P150X4)
+║  Phase:     Loading weights
+║  Progress:  RSS 42.8 GB / ~63 GB est.  [~~68%]
+║             +700 MB/30s  ✓ progressing
+║  Liveness:  405  →  ETA ~8 min
+║
+║  Services
+║  wan2.2        ● 8000  ready
+║  prompt-server ● 8001  ready
+║  z-image-turbo ◌ 8000  loading…
+╚══════════════════════════════════════════════════════
+```
+
+### Key insight from the pain point
+
+The discriminating signal for "stuck vs. working" is NOT CPU% (a tight loop looks the same as g++ compiling). The three independent progress probes are:
+1. `.o` file count growing (compile phase)
+2. RSS growing (load phase)
+3. open `.safetensors` file descriptors present (load phase cross-check)
+
+A hung process shows CPU at 0% or 100% but ALL THREE flat — that's the alarm condition.
+
+---
+
+*Phase 22 status: **PLANNED** — Claude sesssion in tt-local-generator, July 2, 2026*
+
+---
+
+## Phase 23 — Hivemindsweeper: activity sniffer TUI mode (July 14, 2026, v0.7.34)
+
+**What it is**: a new opt-in, read-only `DisplayMode::HivemindSweeper` (press
+`~`) that correlates driver messages, tt-metal compile-cache churn, host/docker
+log tails, `/proc` device-fd activity, and the tt-metal Inspector log into one
+`source × device/host` decaying-heat board plus a live, filterable event feed
+— a minesweeper-style board for "what is touching my hardware right now,"
+built entirely from a 12-task spec-driven plan (`.superpowers/sdd/`).
+
+### Architecture (Tasks 1–11, landed earlier in this session)
+
+- **Event model + ring buffer** (`src/workload/hivemind/event.rs`,
+  `mod.rs`): `SniffEvent { source, device, severity, kind, text, origin }`,
+  a bounded `VecDeque` ring with a drop counter so a channel-full burst never
+  blocks a collector.
+- **Source classifier** (`classify.rs`): frontend-over-generic precedence
+  (ttnn, tt-metal, tt-lang, tt-forge, tt-xla, vLLM, driver, inspector, host,
+  unknown) from a process name + a line of text.
+- **Decaying heat grid** (`grid.rs`): `source × Column` (`Device(n)`/`Host`)
+  cells that light up on activity and fade over time — `heat_char` renders
+  `· ░ ▒ ▓ █`.
+- **Panic-isolated `Collector` trait + `spawn`** (`collector.rs`): every
+  collector runs on its own thread behind `catch_unwind`; a panicking
+  collector reports `CollectorStatus::Err` instead of taking down the engine.
+- **Five auto-spawned collectors** (`collectors/`): `kmsg` (`/dev/kmsg` driver
+  messages, non-blocking so shutdown is honored), `cache_watch` (tt-metal
+  compile-cache artifact churn, polling), `log_tail` (host + `docker logs -f`
+  tails), `procfs` (`/proc/*/fd` Tenstorrent device-fd open/close), `inspector`
+  (tt-metal Inspector log file). All read-only; graceful degrade
+  (`PermDenied` status) when a source isn't accessible.
+- **`wrap` collector** (`collectors/wrap.rs`): three modes — `File(path)`
+  (tail), `Pid(n)` (device-fd diff + best-effort log tail via `/proc`,
+  Linux-gated), `Command(argv)` (spawn + capture stdout/stderr as `Emission`
+  events — the only mode with a real side effect, no shell/no env injection).
+- **Engine** (`Hivemind` in `mod.rs`): `start()`/`stop()`/`poll()` own the
+  channel and all collector handles; `add_watch_path`/`add_watch_pid`/
+  `add_wrap` auto-start the engine (idempotent) and push a `wrap` collector
+  handle alongside the five auto-detected ones, so one `stop()` tears
+  everything down.
+- **TUI board + feed** (`src/ui/tui/hivemind_view.rs`): `render_hivemind`
+  draws the heat board (rows = active sources, columns = `D0..Dn` + `Host`)
+  and a feed pane beneath it, filtered by the selected cell (or unified) and
+  a severity floor. Left/bottom-border-only, sized to the terminal — no
+  hardcoded panel width. `~` activation, choke-point `stop()` on every mode
+  transition (`~`/Esc/`v`/jump keys/`/mode <x>`) so the five-plus collector
+  threads never leak.
+
+### This task (12, final): cursor/feed controls + commands + docs
+
+- **`HmCmd` parser** (`src/ui/tui/mod.rs`): `parse_hivemind_cmd(rest)` parses
+  `/watch`'s argument (`pid <n>` → `WatchPid`, anything else → `WatchPath`),
+  `parse_hivemind_cmd_wrap(rest)` splits `/wrap`'s argv on whitespace (no
+  shell semantics — matches the collector's own no-shell `Command::new`
+  contract). TDD'd first (red: undeclared `HmCmd`/functions; green: 7 tests
+  in `hm_cmd_tests`, including the spec's verbatim case).
+- **Command-bar dispatch** (inline in the Enter handler, alongside the
+  existing `/remote`/`/serve` special-cases, because starting the engine
+  needs the loop's live `hivemind: Option<Hivemind>` slot that
+  `execute_command` doesn't have): `/hivemind` (and `/mode hivemind`, which
+  is specifically intercepted *before* falling through to
+  `execute_command`'s generic `"mode"` match, precisely so it can start the
+  engine) enters the mode; `/watch <path>` / `/watch pid <n>` spawn the
+  matching collector and jump into the mode; `/wrap <cmd…>` is gated behind
+  a confirmation — the first `/wrap <argv>` stashes `argv` in
+  `hm_pending_wrap` and reports "re-run /wrap <argv> to confirm"; typing the
+  *exact same* `/wrap <argv>` again is what actually calls `add_wrap`. Any
+  other command clears a pending confirmation, so a stale `/wrap` prompt
+  can't be silently confirmed by an unrelated later `/wrap`.
+  `execute_command`'s `"mode"` match also gained a `"hivemind"` arm as a
+  thin, documented alias (sets `display_mode` only — can't start the engine
+  without the loop's `hivemind` slot) for any caller that reaches it
+  directly.
+- **In-mode keys** (`hjkl`/arrows move `hm_cursor` clamped to
+  `hivemind_view::board_rows` dimensions, `f` toggles `hm_unified`, `s`
+  cycles `hm_sev` Trace→Info→Notice→Warn→Error→Trace): all four guarded with
+  `if display_mode == DisplayMode::HivemindSweeper` match arms placed ahead
+  of the unguarded global `l` (legend toggle) arm — Rust tries match arms in
+  order, so `l` moves the cursor right while in this mode instead of
+  toggling the legend (still reachable via `/legend`). `h`/`j`/`f`/`s` had no
+  prior global bindings; `k`/arrows already had mode-guarded meanings
+  elsewhere (Insights kill-confirm/fleet-nav) that this mode's guard doesn't
+  collide with.
+- **Overlays**: Legend gained lines for the heat ramp, `hjkl`/arrows, `f`,
+  `s`, and `/watch`/`/wrap`; Help gained rows for `/hivemind`, `/watch
+  <path>`, `/watch pid <n>`, `/wrap <cmd…>`; Explain gained a paragraph on
+  controls and the `/wrap` confirmation.
+- **Manual smoke** (mock backend, 4 devices, tmux): `~` → board renders,
+  collectors all `●`; `f`/`s` → feed header flips to "unified" and the
+  severity floor advances; `/wrap echo hello` → confirmation message, then
+  the same command again → `wrap:command` collector appears and an
+  `Emission` lane shows `info unknown host hello` in the feed; `/watch
+  <file>` → `wrap:file` collector appears and an appended line shows up
+  live; `hjkl` cursor movement doesn't panic on a 1×1 board; `/legend` and
+  `/explain` render the updated overlay text; `q` exits the process
+  cleanly.
+- **Version bump**: `scripts/bump-version.sh 0.7.34` (Cargo.toml,
+  QUICK_START.md, site/index.html, debian/changelog's top-stanza version
+  token) — the script only rewrites the version token, so the
+  `debian/changelog` stanza body was hand-edited to describe the whole
+  Hivemindsweeper feature (Tasks 1–12), since this is the point the mode
+  became fully interactive/user-facing.
+
+Full task-by-task detail and TDD evidence: `.superpowers/sdd/task-12-report.md`
+(this task) and `task-1..11-report.md` (the rest of the subsystem).
+
+---
+
+*Phase 23 status: **COMPLETE** — 12/12 tasks done, v0.7.34*
+
+---
+
+## Phase 24 — Hivemindsweeper hardening, real-world tuning + release (July 15–16, 2026, v0.7.35 → v0.7.40)
+
+Phase 23 introduced the mode at **v0.7.34**; Phase 24 is the run of fixes and
+enhancements — driven by real bring-up/serving sessions on 4× Blackhole — that
+took it to the **v0.7.40** release on the Tenstorrent apt repo. (The Phase 23
+heading keeps `v0.7.34` deliberately: that's when the mode landed, not the
+release version — this section records the path to 0.7.40.)
+
+* **v0.7.35** — `l` restored to the legend inside the sweeper (Task 12 had
+  bound it to cursor-right, shadowing the global legend key); cursor is now
+  arrows + vim `h`/`j`/`k`. Also rustfmt'd the collector files (latent drift).
+* **v0.7.36** — the "everything shows as `unknown`" fix: procfs classifies fd
+  events by **cmdline** (not just `comm`) + a pid→(name,source) cache so closes
+  reuse the open's source (with a Critical fix for multi-fd-close-in-one-poll);
+  plus the **coalesced count+rate feed** (`feed.rs` — repeats fold into one row,
+  device-poll churn folded) and per-cell **sparkline + pulse** animation.
+* **v0.7.37** — classify device-holders by their loaded TT libraries
+  (`/proc/<pid>/maps`) + a `Source::Workload` fallback, so a `python -m pytest`
+  workload isn't `unknown`; a throttled **holder heartbeat** keeps steady
+  device-holders visible; cache_watch now also scans `~/.cache/tt-metal-cache`.
+* **v0.7.38** — the **KITT** red-gradient scanner bar (idle-dim; slows, focuses,
+  and brightens with total activity).
+* **v0.7.39** — fan-RPM fix: `SmbusTelemetry::fan_rpm()` filters the firmware
+  all-ones sentinel (`0xFFFF`/`0xFFFFFFFF`) so fanless cards don't show
+  "65535 RPM" on the Insights screen.
+* **v0.7.40** — `--mode hivemind` launches straight into the mode (CLI alias for
+  `~`); documented HivemindSweeper in README/QUICK_START/site with a live
+  4× Blackhole capture; documented apt-repo install (`ppa.tenstorrent.com`).
+  Release `.deb`s validated in a clean noble container.
+
+CI note: every CI job runs `cargo … --locked`, so a version bump must
+regenerate `Cargo.lock` **before** committing — otherwise the lockfile lags
+`Cargo.toml` and all `--locked` jobs fail with "cannot update the lock file"
+(this bit the 0.7.38→0.7.39 push once; fixed by committing the synced lock).
+
+---
+
+*Phase 24 status: **COMPLETE** — shipped as v0.7.40 on ppa.tenstorrent.com*
+
+---
+
+## Phase 25 — Telemetry expansion (August 2026, v0.8.0)
+
+**Origin**: with HivemindSweeper landed, the next gap was the telemetry
+backends themselves — the sysfs path (the safe, non-invasive default) was
+still missing fields that only tt-smi or Luwen could supply (AICLK, ARC
+heartbeat, real board limits, PCIe link state), and the Luwen path was
+sitting on a 13-months-stale third-party fork. Ten spec-driven tasks
+(`.superpowers/sdd/2026-08-10-telemetry-expansion/`) closed both gaps plus
+two smaller parsing debts (tt-smi 6.x's schema changes, a KV-cache metric
+name mismatch), landing as four work items.
+
+### 1. Sysfs backend: label-aware hwmon + the `/sys/class/tenstorrent` discovery (Tasks 1–3)
+
+The sysfs backend previously assumed a fixed sensor index (`temp1_input` =
+ASIC temp, `in0_input` = vcore, …), which is fragile across hwmon driver
+revisions. It now matches on the `*_label` sibling file instead, and reads
+real per-board limits from `*_max` attributes (125 W / 500 A / 90 °C on a
+p300c) rather than hardcoded constants.
+
+The bigger find: tt-kmd exposes a *second* sysfs surface beyond hwmon — a
+class-attribute directory at `/sys/class/tenstorrent/tenstorrent!N/` — that
+the hwmon node's `device` symlink resolves to. That directory carries two
+kinds of attribute:
+- **Static** (`tt_card_type`, `tt_fw_bundle_ver`): read once at startup.
+  `tt_card_type` gives the *real* board SKU — this **replaces** the old
+  ~1.2 s `tt-smi --version`/`tt-smi -s` startup probe from Phase (0.7.30)'s
+  fix, on any kmd new enough to expose it. No more shelling out just to
+  learn the board name.
+- **Dynamic** (`tt_aiclk`, `tt_heartbeat`): read every tick and fed into
+  the core `Telemetry` struct, which previously hardcoded these to `None`
+  in sysfs mode. A partial `SmbusTelemetry` is synthesized from the same
+  directory (clocks, fan, thermal-trip counters, serial) so sysfs is no
+  longer SMBUS-blind — it just has fewer fields than a full tt-smi/Luwen
+  read.
+
+### 2. Live PCIe bandwidth (Tasks 4–5)
+
+New `src/backend/pcie_counters.rs` reads tt-kmd's `pcie_perf_counters/`
+directory — twelve raw data-word counters — and folds them into inbound/
+outbound directions. Bandwidth is derived as `words × 4 bytes / dt` between
+ticks, with clamping so a counter reset (or wraparound) doesn't spike the
+reading to a nonsense value. This is exposed as a new, defaulted
+`TelemetryBackend::pcie_bandwidth(&self, device_idx) -> Option<PcieBandwidth>`
+trait method — every backend inherits `None` for free, and only sysfs/hybrid
+override it, since they're the only ones with kmd's raw counter files handy.
+
+### 3. tt-smi schema drift + Insights surfacing (Tasks 6–9)
+
+tt-smi's JSON output keeps changing shape underneath us:
+- `board_info` needed tolerant parsing (PCIe speed/width sometimes numbers,
+  sometimes strings across tt-smi releases).
+- tt-smi 5.3.0 changed fan telemetry semantics; the JSON backend now picks
+  whichever of `FAN_SPEED` / `FAN_RPM` holds a real (non-sentinel) RPM,
+  preferring `FAN_SPEED` for back-compat. **Not** an `Option::or` fallback:
+  live tt-smi emits *both* keys, so `or` never falls through, and on
+  Blackhole `FAN_SPEED` is the `0x0` sentinel while `FAN_RPM` carries the
+  reading (the committed fixture: `FAN_SPEED="0x0"`, `FAN_RPM="0x75a"` =
+  1882 RPM). One sentinel predicate — `real_fan_rpm` in
+  `models/telemetry.rs`, filtering `0`/`0xFFFF`/`0xFFFFFFFF` — is now shared
+  by the accessor, the JSON parser, and the luwen mapping.
+- tt-smi 6.x introduced a top-level `processes[]` array (new `DeviceProcess`
+  model, `device_processes()` trait method, wired through JSON *and*
+  WebSocket backends) and `telemetry.board_power`.
+- Both Prometheus scrapers (vLLM + the media-server path from the July
+  media-inference work) were only recognizing one of the two KV-cache
+  metric names different vLLM builds emit; a shared `parse_kv_cache_line`
+  helper now accepts either `gpu_cache_usage_perc` or `kv_cache_usage_perc`.
+
+All of the above needed somewhere to show up: the Insights sidebar gained
+Current (against the TDC limit), Board power, a two-row PCIe panel (link
+geometry + live ▼/▲ bandwidth from item 2), GDDR ECC (uncorrectable counts
+emphasized in red), and thermal-trip rows. A new `DeviceMeta` struct carries
+PCIe geometry + board power through the hybrid backend's sysfs/JSON merge,
+and `format_bandwidth` ships with a unit-tested, provably-bounded ≤9-char
+output so the panel layout can't wrap under any input.
+
+### 4. Luwen: fork → official crates (Task 10)
+
+`all-smi-luwen-core`/`-if`/`-ref` — the third-party forks the Luwen backend
+was built on since Phase 6 — had gone 13 months without a release and were
+missing Blackhole telemetry tags entirely. Migrated to the crates.io
+`luwen-api`/`luwen-pci`/`luwen-def` 0.8.5 crates published directly from
+`tenstorrent/luwen`. This is a straight upgrade in capability: Blackhole
+GDDR temperatures and ECC counters, harvesting/enabled core masks, thermal
+trips, and input/board power-limit fields the forks never surfaced.
+
+> ✅ **Verification status: run on 4× Blackhole p300c (tt-kmd 2.9.0) while the
+> cards were idle.** All four chips are detected and the readings agree with
+> the sysfs/hybrid path and `tt-smi -s` (power, current, ASIC + GDDR temps, ETH
+> link state). Two mappings this migration had to get right were confirmed
+> live: `arc0_health` from `telemetry_heartbeat()` — Blackhole never assigns
+> the per-ARC registers, so the raw fields read 0 and the Insights engine
+> declares every healthy card `Stalled` with high confidence — and
+> `ENABLED_ETH` + `EthLiveStatus` together yielding `12/12 live` instead of a
+> dark `0/12`.
+>
+> Still open: **Wormhole/Grayskull** (no such silicon here; their layouts rest
+> on unit tests over hand-built `Telemetry`, with arch gating so BH-only tags
+> aren't published as a confident `0` on WH) and **behaviour under load** —
+> every check so far was against idle cards, which is why the backend stays
+> launch-only. Comparing side-by-side against the safe backend is the cheapest
+> way to catch a bad register mapping: that is exactly how the missing
+> `Device::limits`/`firmwares` population was found (the Temp row showed the
+> generic `lim 105°C` instead of the board's real 90 °C).
+
+**Which crate does what** (this cost a bug — see below):
+- **`luwen-pci`** owns the PCIe transport *and* local enumeration:
+  `PciDevice::scan()` → `ExtendedPciDevice::open()` → `Chip::open()`, wrapped
+  as `luwen_pci::detect_chips_silent(options)`. This is the path upstream's
+  own `detect_chips`/`detect_local_chips` helpers and `examples/demo.rs`
+  take.
+- **`luwen-api`** owns only the protocol/arch layer (`Chip`,
+  `ChipImpl::get_telemetry`, the per-arch telemetry decode). It has **no
+  hardware transport** — no PCI/ttkmd crate anywhere in its dependency set.
+  Its same-named `detect_chips_silent(root_chips, options)` takes the root
+  chips as its *first argument* and enumerates outward from them, so calling
+  it with `Vec::new()` returns `Ok(vec![])`. The first cut of this migration
+  did exactly that and could therefore never detect a device: init always
+  failed "No devices found". Fixed by adding `luwen-pci` to the
+  `luwen-backend` feature and enumerating through it.
+- `luwen-kmd` comes in transitively (via `luwen-pci`) and isn't referenced
+  directly. The umbrella `luwen` crate is just re-exports of all four.
+
+Detection yields `UninitChip`s. We deliberately do **not** call
+`UninitChip::init()` — that re-runs `wait_for_init` and drives DRAM/ETH
+bring-up, which a read-only monitor has no business doing to a card that may
+be busy. Telemetry lives behind the ARC, so `arc_alive()` is the whole
+precondition and `upgrade()` just unwraps the already-open handle.
+
+**Blackhole vs Wormhole is load-bearing in the mapping.** BH assembles its
+`Telemetry` from a *tag table* and finishes with `..Default::default()`; WH
+reads a *fixed-offset* struct and likewise defaults the BH-only fields. So a
+field the other arch doesn't emit reads `0`, indistinguishable from a real
+zero — and the first cut published all of them unconditionally as `Some(0)`.
+Four consequences, all fixed and unit-tested against hand-built
+`luwen_api::chip::Telemetry` values (the only verification possible without
+hardware — see `map_smbus`/`map_telemetry`, extracted from `update()` for
+exactly this reason):
+- **`arc0..3_health` are never assigned on BH** (only `timer_heartbeat` is).
+  A permanent `Some(0)` fed `InferenceEngine`, whose stall signal *is* an
+  unchanging observed counter → every device classified `Stalled` with
+  `Confidence::High` after ~30 frames. `arc0_health` now comes from
+  `telemetry_heartbeat()` (the accessor that papers over the gap), matching
+  where both safe backends put it (json: `TIMER_HEARTBEAT`, sysfs:
+  `tt_heartbeat`); `arc1..3` stay `None` on BH so the detector reads them as
+  "not observed" rather than "frozen".
+- **`thm_limits` was a raw register** while every other backend writes
+  decoded °C — and `starfield.rs` uses it directly as a trip point, so it
+  evaluated to ~6.8M and the thermal-headroom cue could never fire. New
+  shared `thm_limit_shutdown_c` helper: WH packs throttle (high half) and
+  shutdown (low half) into one word, BH's `ThmLimits` tag is already plain
+  °C — matching tt-smi's own `get_chip_limits`/`get_bh_chip_limits`.
+- **ETH read "0/12 live" on a healthy card**: `enabled_eth` (denominator)
+  was populated but `eth_live_status` (numerator) left `None` — worse than
+  the honest `0/?` it replaced. On BH the numerator *is* there:
+  `blackhole.rs` maps `TelemetryTags::EthLiveStatus` into the `eth_status0`
+  field. Both are now published on BH; on WH, where neither mask exists,
+  both stay `None`.
+- **`pcie_status` and `fan_speed` came out blank/zero.** Downstream
+  `pcie_status` means PCIE_USAGE, a *lane count* (json.rs maps tt-smi's
+  `PCIE_USAGE` there; `defrag.rs` parses it as 4/8/16); BH publishes that as
+  the `PcieUsage` tag → `enabled_pcie`, and never assigns `pcie_status`.
+  Fan: BH leaves `FanSpeed` at the `0` sentinel and carries RPM in `FanRpm`
+  — the same split tt-smi shows, so it reuses the shared sentinel predicate.
+
+**Device-index ordering (found in the same review, affects the safe path).**
+`SysfsBackend::detect_devices` assigned indices in raw `fs::read_dir` order,
+which is neither hwmon-number nor bus-id order and isn't stable across boots
+(measured here: 04:00.0, 03:00.0, 01:00.0, 02:00.0). `HybridBackend` joins
+tt-smi metadata and SMBUS telemetry **by index**, and `tt-smi -s` orders
+`device_info[]` ascending by bus id — so every card displayed another card's
+DDR/ARC/GDDR/ECC/trips/fan/clocks plus this release's new PCIe geometry and
+board power. Discovery is now collect → sort by bus id → assign indices.
+**If you add another per-index map to that backend, populate it from the
+sorted sequence.**
+
+**Why Luwen stays launch-only.** Beyond the long-standing "direct PCI BAR0
+access can disrupt a running workload" reasoning from Phase 14, task 10's
+research surfaced a sharper, driver-specific reason to never fold Luwen into
+auto-detect or the live `b` backend-cycle key: on tt-kmd ≥ 2.9/2.10, simply
+holding `/dev/tenstorrent/N` open participates in driver-managed power-state
+aggregation across all openers, and can block `O_EXCL` openers like
+`tt-flash`. An idle monitoring tool has no business being a silent
+participant in another tool's exclusive-access contract — Luwen remains
+`--backend luwen` only, by explicit user request, exactly as it's been since
+Phase 14.
+
+### Release hygiene
+
+Also folded into this release (deferred minors flagged in earlier task
+reviews, not new work): a `cargo fmt` pass (several tasks' code came from
+plan snippets that weren't rustfmt-shaped, and CI's `cargo fmt --check` gate
+is strict); a `cli.rs` test (`test_luwen_validation`) that only asserted the
+correct thing under one of the two `luwen-backend` feature states; a stale
+CI comment still naming the abandoned `all-smi-luwen-if` fork; and narrowing
+an `#[allow(deprecated)]` in `luwen.rs` from covering a whole `match arch`
+down to just the one arm (`Arch::Grayskull`) upstream actually deprecated.
+
+### Two more traps the final review caught (both safe-path)
+
+* **`smbus_smooth::apply_ema` enumerates fields by hand**, and it carried none
+  of the ten *non-string* `SmbusTelemetry` fields (GDDR temps, ECC counters,
+  `max_gddr_temp`, the `enabled_*`/`eth_live_status`/`harvesting_state`
+  bitmasks). Since `HybridBackend` only clones the whole struct on the
+  **first** insert for a device, those froze at the first snapshot — so the
+  new GDDR ECC row was permanently inert (counters read 0 on a healthy boot,
+  and anything accruing later never showed). They're copied straight through
+  now; **none of them wants EMA** — counters are monotonic, `max_gddr_temp`
+  is a maximum (smoothing a max understates the peak), and an interpolated
+  bitmask is meaningless. **Adding a field to `SmbusTelemetry` means adding a
+  line here too** — the compiler will not tell you.
+* **`HybridBackend::smbus_telemetry()` returned only the tt-smi blend.** On a
+  modern-kmd box with no tt-smi installed, auto-detect still lands on Hybrid,
+  so it reported `None` for every device and item 1's whole sysfs synthesis
+  (fan, clocks, therm trips, serial, heartbeat) was reachable only via an
+  explicit `--backend sysfs`. It now falls back to the inner sysfs cache per
+  device index, with the richer tt-smi blend still winning where present.
+
+### Two parity gaps found by running luwen against the safe backend
+
+Taylor put a `--features luwen-backend` build side by side with the default
+(hybrid) build on the same 4× Blackhole p300c box and diffed the Insights
+sidebar. Two of the release's headline features turned out not to reach two of
+the four backends:
+
+* **luwen never populated `Device::limits` / `Device::firmwares`.**
+  `detect_devices` hardcoded both to `None` while building each `Device`, even
+  though luwen's `Telemetry` carries all of it. Visible as `Temp 38.4°C (lim
+  105°C)` where the safe backend showed `(lim 90°C)` (105 is the UI's generic
+  fallback), a Current row with no `(lim 500A)` at all, and an FW row of `—`.
+  New `map_limits`/`map_firmwares` are fed by the telemetry read
+  `detect_devices` was *already* doing for the board type, so no second
+  hardware touch. Field names on `luwen_api::chip::Telemetry`:
+  `tdp_limit_max`, `tdc_limit_max`, `aiclk_limit_max`, `thm_limit_throttle`,
+  `fw_bundle_version`.
+  - **`thm_limit` comes from `thm_limit_throttle` (90 °C), not `thm_limits`
+    (110 °C).** Three different thermal numbers live within one register set:
+    the throttle trip (hwmon `temp1_max`, tt-smi `therm_trip_l1_limit`), the
+    shutdown trip (tt-smi `thm_limit`), and luwen's packed `thm_limits` word.
+    `DeviceLimits::thm_limit` is *the number the UI prints next to Temp*, so it
+    must be the throttle point on every backend or the same row means different
+    things depending on how you launched.
+  - **Limits stay `None` on Wormhole** — those four are BH telemetry *tags*
+    that WH's fixed-offset struct never assigns, so they read 0, and
+    `Some(0.0)` renders "(lim 0W)": worse than no annotation. (WH's throttle
+    point *is* derivable from the high half of its packed `thm_limits`, but
+    there's no WH source for TDP/TDC/fmax, so the block would still be mostly
+    invented.) `fw_bundle_version` is **not** arch-gated — WH populates it too
+    (telemetry offset 49, ARC fw ≥ 2.25.0.0) — but a zero register is treated
+    as "not reported" rather than decoded to a fake "0.0.0.0".
+  - The **PCIe row is legitimately absent** on luwen (no `pcie_bandwidth()`,
+    and no link speed/width source at all — only `PCIE_USAGE`, a lane count).
+    Documented in the module header instead of faked.
+
+* **`--backend json` never parsed the `limits` block at all.** tt-smi emits it
+  with **string** values (`"tdp_limit": "125"`, alongside bare-number
+  `bus_peak_limit: 0` — it is inconsistent *within one object*), and serde
+  fails the whole struct on one bad field, so `Device::limits` was `None` and
+  the pure-JSON path fell back to the generic 300 W / 105 °C this release
+  claims to have replaced. The hybrid path masked it for months because hwmon
+  `*_max` supplies its limits instead — **a bug in one backend's parse can hide
+  behind another backend's redundant source.** `DeviceLimits` now deserializes
+  through a tolerant `DeviceLimitsRaw` (`#[serde(from)]`), which is also where
+  the `therm_trip_l1_limit`-over-`thm_limit` preference lives, so every JSON
+  consumer gets the same semantics for free. The two number-or-string
+  deserializers moved from `backend/json.rs` to `models::serde_num` — models
+  must not depend on backend. tt-smi's `firmwares` block needed no change:
+  checked live, every member is a string and all four modelled fields are
+  `Option<String>`.
+
+---
+
+*Phase 25 status: **COMPLETE** — shipped as v0.8.0. Safe (sysfs/hybrid/json)
+and luwen paths all verified on 4× Blackhole p300c; luwen remains explicit-only
+(never auto-detected) and unverified on Wormhole/Grayskull and under load.*
+
+---
+
+## Phase 27 — Direct (non-Docker) vLLM-on-TT detection (August 27, 2026, v0.9.0)
+
+**Origin**: the `[i]` Inference Server panel (Phase 22/25's monitoring
+pipeline) only ever detected TT inference servers launched via `docker run`
+— keyed by container name, probed with `docker exec`/`docker stats`. A
+direct vLLM launch (`tt-model serve` from `tt-tnt`, which execs either
+`vllm serve <model> ...` or `python3 server_example_tt.py --model <model>
+...` directly, no Docker involved) was invisible to it — the generic
+`inference_match()` classifier tagged it `"vllm"` for the plain process
+table, but it never reached the rich phase/progress/metrics panel. The code
+had already anticipated this gap: `Source` carried a commented-out `Host {
+unit_or_pid: String }` trail variant, and `ContainerProbe`'s doc comment
+said "a host/systemd impl for non-Docker installs would implement this same
+trait." Built via the full brainstorming → spec → plan → subagent-driven-TDD
+pipeline: design doc at
+`docs/superpowers/specs/2026-08-27-direct-vllm-detection-design.md`, plan at
+`docs/superpowers/plans/2026-08-27-direct-vllm-detection.md`.
+
+### What changed
+
+- **`Source::Host { pid }`** joins the existing `Source::Docker { container
+  }`. A new `service_key()` helper derives a stable identity/dedup key for
+  either variant — `container.clone()` for Docker, `"host-vllm-<pid>"` for a
+  bare process — and replaced every place that used to irrefutably
+  destructure `Source::Docker` (adding the variant turned those into compile
+  errors, which is exactly what caught every call site that needed updating).
+- **`parse_direct_vllm`** (pure, in `detect.rs`) recognizes both real launch
+  shapes found in `tt-tnt`'s `docs/serving-with-tt-kernel.md`/`AUTOFIX.md`:
+  `vllm serve <model> ...` (matched by `ends_with("vllm")` on the binary
+  token, not exact-match — a venv console-script's argv[0] is commonly a
+  full path) and `server_example_tt.py --model <model> ...`. Requires
+  `MESH_DEVICE` or `TT_METAL_HOME` present in the process's own environment
+  before treating it as TT-backed — the equivalent of `parse_inference_server`'s
+  `uses_tt_device` check, which has no `/dev/tenstorrent` cmdline analogue for
+  a bare host process. Recognizes `--port <N>` and `--port=<N>`, and falls
+  back to `--model <X>`/`--model=X` when there's no positional model token.
+- **`SystemProbe`** wraps the existing `DockerProbe` and dispatches every
+  `ContainerProbe` call by the identity key's shape: a `"host-vllm-<pid>"`
+  key reads `/proc` directly and runs local `ps`/`sh`, scoped to the launched
+  pid's *whole process tree* (a new `process_tree_pids` walker, cycle-guarded
+  with a `HashSet`) — a bare process has no cgroup/PID-namespace boundary the
+  way a Docker container does, so a `g++` compile child or a TT device
+  worker subprocess would otherwise be invisible to CPU/RSS aggregation.
+  Anything else forwards unchanged to the wrapped `DockerProbe`, so the
+  Docker path is untouched byte-for-byte (confirmed in the final review: no
+  surviving `Source::Docker`-only assumption anywhere in the crate).
+- **Host-keyed liveness doesn't guess a process name.** The Docker path's
+  `contains_python` heuristic (checks `ps`'s `comm` column for `"python"`)
+  was calibrated for a `python3` entrypoint and would have misread a
+  compiling/loading `vllm serve` as `Down` for the entire silent window this
+  feature exists to illuminate — a pip console-script's `comm` is the
+  script's own name (`vllm`), not `python3`. Fixed during final review: for a
+  host key, "the tree-scoped `ps` returned at least one data row" is
+  sufficient liveness evidence, since that invocation is already scoped to
+  exactly the right pids.
+- **`host_exec` allowlists env vars instead of copying the target's
+  environment wholesale.** Also caught in final review: on a shared,
+  root-run box, blindly forwarding a locally-launched process's full
+  environment into the monitor's own spawned shell (to run the
+  `KERNEL_FIND_CMD`/`LOADED_FIND_CMD` probes) would have let a local user
+  plant `LD_PRELOAD` and have it honored by a root process. Now forwards
+  only `TT_METAL_HOME`/`CACHE_ROOT`/`HOME` (exactly what those two shell
+  strings expand) plus a `PATH` fallback.
+- Everything downstream — `fold_tick`, `Phase::derive`, `is_alarm`,
+  `estimate_progress`, `parse_vllm_metrics`, `service_for` — needed zero
+  changes, since it already operated on the backend-agnostic
+  `ServiceState`/`TickSample` shapes with no knowledge of `Source`.
+
+### Process notes
+
+- Built with `subagent-driven-development`: 7 tasks, each with its own
+  fresh-implementer + task-reviewer pass, plus a final whole-branch review
+  on the most capable available model.
+- **A plan defect surfaced mid-execution, not during brainstorming**: the
+  plan's own Global Constraints section reasoned that `process_tree_pids`
+  needed no extra `#[cfg]` gating beyond `detected_inference_servers()`'s
+  existing one, because `SystemProbe`'s host branch is "only ever reached at
+  runtime" via a `Source::Host` value — true, but irrelevant to Rust, where
+  an unconditionally-*called* `#[cfg(target_os = "linux")]` function fails
+  to compile on other targets regardless of whether it's ever invoked. Broke
+  the crate on the macOS/Windows CI jobs; caught by the Task 6 reviewer
+  running an actual cross-target `cargo check`, not by inference.
+- **The final whole-branch review earned its keep twice over**: beyond the
+  cross-target compile break (already fixed at the task level by the time
+  final review ran), it independently found the `contains_python` liveness
+  mismatch and the `host_exec` environment-inheritance security gap — both
+  invisible to any single task's review, since each task's diff looked
+  correct in isolation and the problem only exists in how the pieces compose
+  across the whole feature.
+- **Per-task review also caught a CI-invocation-specific bug no test run
+  would show**: Task 1 imported `Source` at module level in `monitor.rs`,
+  but every actual use was inside `#[cfg(test)] mod tests` — genuinely
+  unused under CI's exact `cargo clippy --lib --features tui -- -D
+  warnings` (no `--tests`), invisible under `cargo test --lib` (which
+  compiles `cfg(test)` code). Silently CI-red-eligible from Task 1 through
+  Task 6; caught only because the controller independently ran the literal
+  CI command before signing off on the "final" task.
+
+> ⚠️ **Not hardware-verified.** No box with TT hardware and a real
+> `tt-model serve` launch was available during this development session.
+> See the spec's manual-verification checklist before relying on this in
+> production — in particular the host-liveness heuristic and the
+> `CACHE_ROOT`/weight-shard-loading signal, both of which the reasoning
+> above is confident about but only real hardware can confirm.
+
+---
+
+*Phase 27 status: **COMPLETE, pending hardware verification** — shipped as
+v0.9.0. All automated review gates (7 task reviews + 1 final whole-branch
+review + its one fix wave) passed; no manual verification against real TT
+hardware performed.*
+
+---
+
+## Phase 28 — Per-GDDR-channel telemetry across every memory visualization (August 28, 2026, v0.10.0)
+
+**Origin**: tt-smi ≥ 6.3.0 introduced a new `gddr_telemetry` block per device:
+per-channel training-pass, BIST-pass, harvested/enabled, dual-location
+temperature (top/bottom), and directional correctable/uncorrectable ECC
+counters. Previously the only GDDR signal any backend exposed was the
+packed, whole-board aggregates (`gddr_temps`, `gddr_corr_errs`,
+`gddr_uncorr_errs`) and a 4-bit-per-channel `DDR_STATUS` register — coarser
+than what the hardware can now report. User: *"let's add it in to this
+branch [feat/direct-vllm-detection] please. specialize in making the data
+flow into all of our memory-sensitive visualizations... you should expect
+to see some new magic in everything as a result of collecting this data
+when tt-smi v6.3.0 and above is present. pizzaz!"* Built via
+brainstorming → writing-plans → subagent-driven-development (9 tasks, spec
+at `docs/superpowers/specs/2026-08-28-gddr-telemetry-design.md`, plan at
+`docs/superpowers/plans/2026-08-28-gddr-telemetry.md`), on the same branch
+as Phase 27 (already carrying an open PR).
+
+### What changed
+
+- **Model + parsing (Tasks 1-2)**: `GddrChannel`/`GddrTelemetry` added to
+  `models/telemetry.rs`; `SmbusTelemetry.gddr_telemetry: Option<GddrTelemetry>`.
+  tt-smi's JSON quotes every numeric leaf except `channel` (bare number) and
+  `harvested`/`enabled` (bare bool) — `training`/`bist` are `"pass"`/other
+  strings, not booleans. A malformed channel entry is dropped, never
+  fabricated as zeroed, matching this codebase's existing
+  one-malformed-entry-costs-only-that-entry convention.
+- **Blend guard (Task 3)**: `smbus_smooth::apply_ema` copies the new field
+  through unsmoothed (counters are monotonic, `max_gddr_temp`-style
+  smoothing would understate peaks, bitmasks can't be interpolated).
+  `SmbusTelemetry` gained `#[derive(PartialEq)]` so the existing
+  field-completeness guard test collapsed to one `assert_eq!` — this
+  codebase has silently frozen an unlisted field in this exact blend
+  function twice before (Phase 25), so the guard was worth strengthening,
+  not just satisfying.
+- **Mock fabrication (Task 4)**: `MockScenario::QuadGalaxy` harvests channel
+  3 and BIST-fails channel 5 (device_idx % 17 == 0), so both new visual
+  states are reachable in a demo/test run.
+- **Five consumers (Tasks 5-9)**: chip portrait (DRAM cells: harvested → dim
+  `·`, BIST-fail → red `✗`), Memory Flow's DDR wall (real per-channel
+  training/BIST instead of decoding the packed register), Memory Castle's
+  compact-tier gate row (one glyph per real channel instead of per pair),
+  Starfield's DDR planets (real temperature drives brightness instead of a
+  generic board-wide power/current proxy), and the Insights sidebar (GDDR
+  temp row prefers real per-channel readings; new trained/harvested/
+  BIST-fail summary row; ECC row sums real per-channel directional counters).
+  Every site falls back to today's exact behavior when `gddr_telemetry` is
+  absent or its channel list is empty — no version-string gating anywhere,
+  purely `Option`/`Vec::is_empty()`-driven.
+
+### Position-vs-identity, again
+
+This codebase's own documented bug class (Phase 25/26: a Vec position
+treated as a stable identity) recurred and was caught mid-plan: Task 5's
+first cut used `channels.get(idx)`; the reviewer required
+`channels.iter().find(|c| c.channel == idx)` instead, since a dropped
+malformed channel would otherwise silently misattribute a neighbor's state.
+Tasks 6 and 8 applied the same fix proactively without being told, having
+read the file first per dispatch instructions — the fix propagated cleanly
+across all five consumers with, per the final whole-branch review's
+explicit grep sweep, zero survivors of the positional form anywhere in the
+tree.
+
+### What the whole-branch review caught that no task-scoped review could
+
+Each of the 9 tasks passed its own scoped review (three needed one fix
+round each: Task 3 for the `PartialEq` derive above, Task 5 for the
+identity-lookup fix plus a missing BIST-fail test, Task 7 for test-coverage
+gaps and a stale doc comment on `memory_castle.rs`'s DDR gate row — the
+fallback path itself was independently mutation-tested clean at every
+stage). The final whole-branch review then found four things invisible to
+any single file's diff:
+
+- **The new Insights "GDDR" summary row measured 47 columns in the
+  sidebar's 30-column budget** and silently clipped its own headline
+  BIST-fail count on real hardware — `Paragraph` clips instead of wrapping,
+  exactly the failure mode `eth_dot_budget` was built to prevent for the
+  ETH row (Phase 25), and the width guard's own `worst_case()` test fixture
+  had simply never been extended to set `gddr_telemetry`, so it measured
+  everything except the row that broke.
+- Same stale fixture meant the sidebar's one-row headroom invariant
+  (`rows.len() < INTERIOR_H`) was fully consumed once the new row was
+  accounted for, with every guard still green — the next row added
+  anywhere would have clipped silently.
+- **Starfield's DDR planets were inconsistent on Blackhole**: `gddr_telemetry`
+  reports 8 real channels but `device.memory_channels()` is 12, so 8 planets
+  rendered real per-channel state while the other 4 fell back to the old
+  generic power/current formula right next to them — a direct violation of
+  the spec's own bolded constraint never to derive this loop bound from
+  `memory_channels()`, and a visual regression on the exact hardware this
+  feature targets (pre-branch, all 12 were uniform).
+- **A spec requirement was dropped at plan-writing time**: the spec required
+  the GDDR ECC row to source its sums from per-channel directional data when
+  present; the plan instead said "the ECC row is untouched by this task,"
+  and the task-scoped reviewer verified that as a *positive*. Net result
+  before the fix: `corr_rd`/`corr_wr`/`uncorr_rd`/`uncorr_wr` were parsed,
+  modelled, mocked, and blended — and read by nothing.
+
+All four were fixed in the one allowed fix wave (5 commits — row-width +
+fixture/height fix, starfield fallback restructuring, ECC per-channel
+sourcing, a Memory Castle legend addition, a doc-comment correction) and
+independently re-verified, including a mutation test on the starfield fix's
+discriminating assertion (revert the fix, confirm the new test fails with
+the exact predicted values, restore). Two Minor findings were deferred as
+genuinely benign: `memory_flow.rs`'s DDR-wall channel-status function has
+the same `memory_channels()` loop-bound pattern as the starfield finding,
+but degrades safely (`map_or(0, _)`) rather than rendering inconsistently;
+and `defrag.rs` — a sixth, pre-existing per-GDDR-channel consumer that
+neither the spec nor the plan ever named — still runs entirely on the old
+packed/pair-resolution data and was left alone as out of scope.
+
+> ⚠️ **Not hardware-verified.** No box running tt-smi ≥ 6.3.0 was available
+> during this session. Two items specifically need a real box per the
+> re-review: the Insights row's column math is computed from the format
+> string, not observed on a real p300c: and the ECC row now prefers the
+> per-channel source unconditionally whenever `gddr_telemetry` is present
+> and non-empty — if a real 6.3.0 build ever emits all-zero per-channel
+> counters as placeholders while the packed aggregate carries genuine
+> counts, the row would hide errors it used to show. Both are on the
+> spec's manual-verification checklist alongside the general "does this
+> look right on a live box" pass.
+
+---
+
+*Phase 28 status: **COMPLETE, pending hardware verification** — shipped as
+v0.10.0. All 9 tasks passed scoped review (3 with one fix round each); the
+final whole-branch review found 1 Critical + 3 Important findings, all
+fixed in the one allowed fix wave and independently re-verified (including
+a mutation test); no manual verification against real TT hardware
+performed.*
+
+---
+
+## Phase 29 — Defrag: real per-channel GDDR data + an idle-EVICT bug it surfaced (August 28, 2026, v0.10.1)
+
+**Origin**: after Phase 28 landed, tt-smi ≥ 6.3.0 was actually installed and
+verified live on this box's 4× p300c (all four emit a real `gddr_telemetry`
+block matching the shape Phase 28 was built against). User: *"Did anything
+change with the DEFRAG view these signals can be used for? (And if not,
+being a memory focused module... what can we do?)"* — Phase 28's own final
+review had flagged Defrag as a sixth, untouched consumer of this data
+(deferred as out of scope). Brainstormed as a **bounded** task (existing
+file, existing flow) and implemented directly — no SDD ledger, no spec file.
+
+### What changed
+
+`src/animation/defrag.rs`'s `Channel` struct now sources `trained`/
+`enabled`/`temp_ema`/error counts from real per-channel `gddr_telemetry`
+when present, falling back to the exact pre-existing packed-pair-resolution
+decode (`DDR_STATUS` nibble, `GDDR_x_y_TEMP`, `gddr_corr_errs`) otherwise —
+same `Option`-presence-gated pattern as every other Phase 25/28 consumer,
+no version-string check. Two genuinely new visual states, since real data
+can express things the packed registers never could:
+
+- **`bist_fail`**: a channel that fails BIST renders as a static, permanent
+  dim-red "bad sector" row — distinct from both the harvested hatch and a
+  transient error flash. A harvested channel is never also flagged
+  `bist_fail` (there's nothing to BIST on a channel that doesn't exist).
+- **`uncorr_flash`**: uncorrectable errors (no packed-register equivalent at
+  all before this) flash brighter and longer than a correctable flash,
+  mirroring the Insights sidebar ECC row's red/amber severity convention
+  from Phase 28.
+
+Legend and module doc comment updated to describe both. Regression tests
+(a `FakeBackend` test fixture, since none of this file's existing tests
+drove `update()` through a real backend before) cover: real data overriding
+the packed pair decode at true per-channel resolution (not just per-pair),
+real temp overriding the packed pair-temp, the bad-sector state rendering
+distinctly and never co-occurring with harvested, uncorrectable flash
+severity/duration, and the fallback path being byte-identical when
+`gddr_telemetry` is absent.
+
+### The idle-EVICT bug this surfaced
+
+User, after installing and testing: *"it looks like we're evicting more
+often than before, even on idle."* Investigated per
+`superpowers:systematic-debugging` rather than guessing: the diff for the
+change above touches zero EVICT-relevant state (`power_ema`, `idle_power`,
+`saw_load`, `running_since`, `evict_eligible()` itself all untouched — only
+per-channel `trained`/`enabled`/`temp`/error *sourcing* changed), and
+`DefragVis` persists across frames/mode-switches within one run (only
+resets on process restart). Rather than trust that analysis blind, built a
+binary from the commit immediately before the Defrag change (`git worktree
+add --detach` at the parent commit, built in isolation, installed alongside
+the current binary under a different name) and had the user A/B-test both
+on the same idle hardware — **both evicted repeatedly**, isolating the bug
+as pre-existing and entirely unrelated to the `gddr_telemetry` work.
+
+Root cause: `idle_power` (the EVICT heuristic's baseline) is captured at
+three different phase-transition sites, and two of them use the smoothed
+`power_ema` — but the Idle/Init → Running transition captured it from a
+single raw, unsmoothed `power` sample instead. Since Blackhole's `aiclk` is
+almost always ≥ 200, that transition fires on nearly every tick where power
+clears the idle floor, so any one noisy low sample could set an
+artificially-low baseline; ordinary idle jitter afterward could then both
+arm `saw_load` (exceed `idle_power × 1.5`) and satisfy the evict condition
+(fall back within `idle_power × 1.20`) — evicting a device that never
+loaded anything. Fixed by using `power_ema` at that site too, matching the
+other two. Regression test constructs a device with a stable ~15 W
+`power_ema` and a single noisy 9 W raw sample at the transition tick;
+confirmed red against the old raw-sample capture (`idle_power` landed at
+9), green after the fix (`idle_power` tracks the ~14.5 W smoothed value).
+
+> ⚠️ **Not hardware-verified against a real BIST-fail or harvested channel**
+> — this box's 4× p300c all report healthy channels, so the two new visual
+> states were verified only via the `FakeBackend` unit tests, not observed
+> live. The `gddr_telemetry`-sourced trained/enabled/temp path *is*
+> hardware-verified (confirmed against the same live tt-smi 6.3.0 dump used
+> to verify Phase 28), and the idle-EVICT fix is hardware-verified via the
+> A/B comparison above.
+
+---
+
+*Phase 29 status: **COMPLETE** — shipped as v0.10.1. Bounded task (no SDD
+ledger); real-data sourcing hardware-verified live, bad-sector/uncorrectable
+states unit-tested only (no failing hardware to hand), idle-EVICT fix
+hardware-verified via A/B comparison.*
+
+---
+
+## Phase 34 — Review findings: launch-shape coverage, and two instruments reporting measurements they never made (September 1, 2026)
+
+Three findings from an independent hardware review of PR #26 (4× p300c), all
+non-blocking, all fixed.
+
+**1. `parse_direct_vllm` saw one launch shape in four.** It matched a token
+ending in `vllm` followed by `serve`, so `python -m vllm.entrypoints.openai.
+api_server` fell out entirely — eight real processes invisible in the
+reviewer's run. Rather than add the reported shape, swept the TT tooling
+checked out here for what actually gets launched: `vllm serve` (229
+occurrences), `run_vllm_api_server.py` (64), `python -m vllm.entrypoints…`
+(45), `server_example_tt.py` (20). Two beyond the reported one, neither a
+guess — the module form has a non-`openai` sibling in use, and
+`run_vllm_api_server.py` is reachable on the *host* (not only as a container
+entrypoint) via tt-inference-server's `workflows/run_local_server.py`. That
+wrapper also spells its port `--service-port` and remaps it onto vLLM's
+`--port`, so reading only `--port` reported the 8000 default for every
+non-default launch — the port the liveness probe then polls.
+
+Widening the match made a documented contract load-bearing:
+`parse_direct_vllm` is by contract the *non-Docker* path, and
+`run_vllm_api_server.py` is the ENTRYPOINT of tt-inference-server's own image.
+Containers are enumerated separately (`docker ps`) and merged by container
+name — a key that can never collide with `host-vllm-<pid>` — so a
+containerized match becomes a second roster row for one server: the Phase 30
+duplicate, reintroduced from the other side. Cross-uid `/proc/<pid>/environ`
+is unreadable (measured), which saves an unprivileged run, but that is a
+permission accident and stops holding under root. The host path now drops
+containerized pids, matched per cgroup path *segment* — the docker daemon
+itself lives at `/system.slice/docker.service`, and a substring test would
+exclude host processes on the strength of the daemon's unit name.
+
+**2 & 3 are the same mistake in different clothes**: a reading printed with
+full confidence where the signal was absent, or incapable of distinguishing
+the two states it was asked about.
+
+* **ETH `0/12 live` on a card whose links are all up.** The denominator always
+  distinguished "not reported" (`0/?`); the numerator was
+  `eth_live_status.unwrap_or(0)`, so a build omitting `ETH_LIVE_STATUS` while
+  still emitting `ENABLED_ETH` rendered a confident zero under twelve dark
+  dots. Reproduced end-to-end: a real `tt-smi -s` snapshot with only that key
+  deleted, served back through `--tt-smi-path`, printed exactly
+  `ETH ············ 0/12 live`. Now `?/12` with no dots — a dot's meaning is
+  live-or-not, so with no liveness data there is nothing to draw them from. A
+  *measured* zero stays a loud all-links-down alarm.
+
+* **Defrag `4×RUN` on a fully idle box.** The gate was `aiclk >= 200 && power >
+  8 W`; Blackhole idles at ~800 MHz and 13–16 W, so both halves were
+  permanently true. The surrounding code already knew — `LOAD_SURGE_FACTOR`
+  and `running_since` exist *because* of the phantom-Running state, and say so
+  in their comments. Those treated the EVICT loop it caused; the phase itself
+  stayed wrong. `shows_load()` now asks what the phase means, on two
+  independent signals: the chip's own observed rest (this codebase's standing
+  answer to absolute thresholds — `AdaptiveBaseline`, Phase 5), and the
+  board's firmware-reported TDP limit for a monitor started *during* a
+  workload, where no rest was ever observed.
+
+  **Two adjacent defects had to be fixed for that baseline to mean anything,
+  and neither was visible from the change that motivated it** — both surfaced
+  only because a mutation survived:
+  - The idle arm has **no guard**, so it fires every frame while idle.
+    Assigning `idle_power = power_ema` pinned the threshold to the live
+    reading, making `p > 1.5p` unsatisfiable and leaving the learned half of
+    the gate permanently dead. It is a running minimum now.
+  - The Running transition **clobbered a learned baseline** with the loaded
+    reading. Measured: a 14 W-rest chip pulling 25 W entered Running, rewrote
+    its baseline to 21.3 W, and fell straight back to Idle. It now captures
+    only when no rest was ever observed — the case the Phase 29 fix was
+    actually written for. That capture justified itself with "Blackhole never
+    dwells in Idle", which was true only while this bug existed.
+
+  `power_ema` is also seeded from the first sample rather than climbing out of
+  zero, since the minimum learned underneath a ramping EMA latched onto a ~1 W
+  "rest" no board has.
+
+### A test that encoded the bug it was scaffolding for
+
+`idle_power_baseline_uses_smoothed_ema_not_a_single_raw_sample` asserted
+`Phase::Running` for a **9 W** device, reasoning in its own message that
+"aiclk>=200 and power(9W) > POWER_IDLE_W(8W) must enter Running" — precisely
+the defect under repair, asserted as setup for a different subject. Correcting
+it to `Idle` moved the test off the capture site it was protecting, and
+reverting that hardware-verified Phase 29 fix then passed all 824 tests.
+Coverage restored by a companion test that drives a device genuinely entering
+Running. **Changing a phase gate can silently orphan a regression guard that
+reached its subject only through that phase** — worth a mutation check on the
+*old* fix whenever a state machine's transitions move.
+
+### Verification
+
+Every guard mutation-tested (eleven mutations across the three fixes; each
+reddens only the test covering it). ETH and Defrag both confirmed on the real
+4× p300c: Defrag's header reads `0×DMA  0×RUN  4×idle` at 13–16 W where it
+read `4×RUN`, and the ETH row reads `12/12 live` on the live box and `?/12`
+against the doctored snapshot. Also documented tt-smi's **≥ 6.3.0** floor for
+per-channel GDDR in the README — the fallback to packed registers is
+deliberately silent, so an older tt-smi looks entirely healthy while answering
+at pair resolution.
+
+> ⚠️ A check written into that README section was wrong on first draft
+> (`grep -c gddr_telemetry`, which counts *lines*, and the block is a sibling
+> of `smbus_telem` rather than inside it). It read plausibly and returned `4`
+> on this box — matching the device count by coincidence of pretty-printing.
+> Caught by running it against a snapshot with the block actually removed.
+
+---
+
+*Phase 34 status: **COMPLETE** — v0.13.2. Three review findings fixed;
+findings 2 and 3 were pre-existing on `main`.*
+
+---
+
+## Phase 30 — Inference roster: dedup multiprocessing-worker duplicates (August 28, 2026, v0.10.2)
+
+**Origin**: user shared a screenshot (`~/Pictures/tt-toplike-inference.png`) of
+a real `tt-model serve` launch (`tt-tnt`'s wrapper around a direct vLLM-on-TT
+serve, across all 4 chips of a Blackhole box) — the `[i]` Inference Server
+roster showed *"inference services (26, +18 more)"*, with ~8 visible rows all
+reading `down tt-tnt-1024` and only one correctly reading `compiling 0:15`.
+This is the Phase 27 direct-vLLM-detection feature's first real hardware
+exposure, and the "not yet hardware-verified" caveat from that phase turned
+out to be hiding a real bug.
+
+**Root cause**: `detected_inference_servers()` (`src/workload/host_processes.rs`)
+scans every process in the snapshot and builds one `InferenceServer` per
+matching process, deduped only by `service_key()` — `"host-vllm-<pid>"` for a
+host launch, unique per pid. A real vLLM-on-TT launch across multiple chips
+forks several worker/engine-core processes (one per tensor-parallel rank,
+etc.); `fork()` preserves the parent's full cmdline *and* environment in
+`/proc/<pid>/cmdline`, so each worker independently matches
+`parse_direct_vllm`'s heuristic (the same `MESH_DEVICE`/`TT_METAL_HOME`-gated
+`vllm serve <model>` shape) too. Per-pid keying meant every worker counted as
+its own distinct "service" — confirmed these weren't stale zombies either
+(`remove_dead: true` is already set on the sysinfo refresh), just genuine
+live siblings of one real launch.
+
+**Fix**: `detected_inference_servers()` now builds a pid→parent map from
+`sysinfo::Process::parent()` alongside the existing classification pass, and
+a new pure helper `is_match_root(pid, parent_of, matched)` walks a matching
+pid's ancestry — if any ancestor also matches, the descendant is dropped,
+keeping only the root of each match family. `is_match_root` is generic over
+any `Eq + Hash + Copy` id (not tied to `sysinfo::Pid`), so it's directly
+unit-tested with synthetic parent/match maps rather than needing real forked
+processes: root-with-matching-children, root-with-non-matching-parent,
+matching-grandparent-through-a-non-matching-intermediate-hop, and a
+cycle-defense bound (32 hops — a real process tree is never anywhere near
+this deep). All four tests were mutation-checked (temporarily hard-coded
+`is_match_root` to always return `true`; the two descendant-rejecting tests
+failed as expected, confirming they're real guards, not tautologies).
+
+> Hardware-verified indirectly: the bug was found from a live screenshot, and
+> the root-cause mechanism (fork-preserved cmdline/environ, confirmed
+> non-stale via `remove_dead`) is confirmed against real process semantics —
+> but the fix itself (rebuilt binary against this exact live multi-worker
+> launch) was not re-observed before this release. Worth a follow-up look
+> next time a `tt-model serve` launch is live on hardware.
+
+---
+
+*Phase 30 status: **COMPLETE, fix not re-observed live** — shipped as
+v0.10.2. Bounded bug fix (no SDD ledger); `is_match_root` mutation-tested;
+full suite green.*
+
+---
+
+## Phase 31 — `/code-review` findings: PATH injection, GDDR gaps, redundant I/O (August 28, 2026, v0.10.3)
+
+**Origin**: ran `/code-review medium --fix --comment` against the whole
+branch. The review agent's fix/comment steps stalled (two verification
+sub-agents' results were lost across a session gap), so it returned six raw
+findings — four independently confirmed, two flagged plausible-but-
+unverified — instead of applying fixes. Worked through all six by hand:
+verified each, fixed what was real, and explicitly deferred/discussed scope
+for the two that weren't simple bug fixes.
+
+### 1. PATH injection in `host_exec` (Critical — confirmed real)
+
+`host_exec` (`src/workload/inference_server/probe.rs`) forwarded the
+*target process's own* `PATH` — read from `/proc/<pid>/environ`, of a
+process whose only gate to reach this code path
+(`MESH_DEVICE`/`TT_METAL_HOME` present in its own environment) is entirely
+self-reported — onto the `sh` it spawned via `Command::new("sh")`, a
+bare-name lookup. The review flagged this as merely "plausible," needing a
+check against actual `std::process::Command` semantics. Verified
+empirically before touching any code: wrote a throwaway Rust program that
+placed a fake `sh` on a `PATH` set only via `.env()` on the builder (never
+the process's own OS-level `PATH`) and confirmed the fake binary executes.
+So `Command::new("sh")` resolves via whatever `PATH` ends up on the
+*builder*, not the calling process's real environment — the vulnerability
+is real, and structurally identical to the exact `LD_PRELOAD`-style attack
+this same function's `HOST_EXEC_FORWARDED_VARS` allowlist was built to
+prevent (Phase 27) — `PATH` had simply slipped through unguarded.
+
+Fixed by invoking the interpreter via an absolute path (`/bin/sh`, never a
+bare-name lookup) and dropping the target-PATH-forwarding branch entirely —
+always a fixed, conservative `PATH` (`/usr/bin:/bin:/usr/local/bin`,
+sufficient for the only two commands the shell probes ever run, `find` and
+`wc`). TDD'd with a real spawned process, not a mock: a first draft of the
+regression test planted a fake `find` instead of a fake `sh` and passed
+vacuously against the *pre-fix* code too — with no fake `sh` present, the
+buggy `Command::new("sh")` failed to resolve at all under the attacker's
+narrow `PATH`, so the exploit path was never actually exercised. Rewritten
+to fake `sh` itself; confirmed red against the vulnerable code (the fake
+`sh`'s marker string came back in the output), green after the fix.
+
+### 2. Four GDDR-telemetry correctness gaps (Important — all confirmed)
+
+All in the same family as Phase 28/29's own fallback bugs — real data
+present but degrading incorrectly instead of falling back cleanly:
+
+- **`chip_portrait.rs`**: the DRAM column→channel index mapping capped at
+  `idx >= 8`, a leftover from the packed 8-channel `DDR_STATUS`-bitmask era,
+  copied onto the new `gddr_telemetry` lookup even though real channels are
+  found by `.channel` id via `.find()` (which already handles absence
+  correctly). The cap only discarded real fault/temperature data for
+  Blackhole's channels 8–11. Removed at both the glyph and color sites.
+- **`starfield.rs`**: DDR planet activity/color checked `harvested` but not
+  `enabled`, unlike `memory_flow.rs`/`memory_castle.rs`'s established
+  `c.harvested || !c.enabled` convention (Phase 28) — an
+  administratively-disabled-but-not-harvested channel rendered as a live,
+  glowing planet instead of inert, an inconsistency across visualizations
+  for identical hardware state.
+- **`ui/tui/mod.rs`**: the GDDR temp and ECC rows only fell back to the
+  packed-aggregate reading when `gddr_telemetry` was `None`/empty — not when
+  present but yielding nothing usable (every channel's temp fields `None`,
+  or every non-harvested channel's ECC counters reading zero). `Some(vec![])`
+  / `Some((0,0))` isn't the same as "no real data"; both rows now fall back
+  whenever the real-data result didn't actually produce anything.
+- **`models/telemetry.rs`/`backend/json.rs`**: `GddrChannel`'s four ECC
+  counters were plain `u64`, parsed via `str_u64(...).unwrap_or(0)` —
+  conflating a missing/malformed field with a genuine zero reading. The
+  review flagged this as plausible but noted the code's own doc comment
+  documented it as an intentional simplification, and a proper fix meant
+  widening the type to `Option<u64>` across ~5 consumer files — bigger scope
+  than the other three. Asked explicitly before doing it; user chose to do
+  the full refactor. `temp_top`/`temp_bottom` already used this pattern, so
+  every consumer just added its own `.unwrap_or(0)` at the point of use.
+
+Every fix has a dedicated regression test confirmed red against the
+pre-fix behavior and green after (temporarily reverting the fix in place,
+running the test, restoring — never trusting a test's color without seeing
+both).
+
+### 3. Redundant per-tick probe I/O (Minor — confirmed, fixed after asking)
+
+`build_sample`'s sequence for one host-keyed service independently re-read
+`/proc/<pid>/environ` up to four times and re-walked `process_tree_pids`
+twice per tick, spawning two separate `ps` subprocesses along the way —
+flagged as a background-thread perf nitpick, not correctness/security.
+Asked whether it was worth the risk of touching the same file right after
+the security fix; user said fix it too. Added `HostProbeCache`, a
+short-TTL (500ms — long enough to cover one tick's calls, short enough to
+be stale well before the next) per-pid memoization inside `SystemProbe`
+(plain `RefCell`, not `Mutex` — the probe runs on one dedicated background
+thread, confirmed by reading `spawn_with_probe`, never called
+concurrently). `host_exec`/`host_stats_text`/`host_top_proc_cmd` now take
+pre-fetched environ text / pid lists as parameters instead of re-deriving
+them from a bare pid. Mutation-tested: temporarily dropped the cache's
+pid-key comparison (so any cached entry would satisfy any pid), and the new
+regression test (two real spawned processes with distinct environments,
+interleaved reads) failed exactly as expected.
+
+Both cross-compile targets (`x86_64-pc-windows-gnu`,
+`x86_64-apple-darwin`) checked clean after all of the above — the
+non-Linux `process_tree_pids` fallback and the cache/`SystemProbe`
+structure are unaffected by the `#[cfg(target_os = "linux")]` gating that
+already existed.
+
+---
+
+*Phase 31 status: **COMPLETE** — shipped as v0.10.3. All 6 code-review
+findings resolved: 1 security fix (empirically verified vulnerable-then-
+fixed), 4 correctness fixes (each red/green tested), 1 perf fix
+(mutation-tested). Two findings (#3's refactor scope, #6's fix-or-defer)
+explicitly discussed with the user before acting rather than silently
+decided. Full suite + fmt + clippy + both cross-compile targets green.*
+
+---
+
+## Phase 32 — Training view: watch a live tt-train run (August 29, 2026, v0.11.0)
+
+**Origin**: every other view watches inference or generic hardware activity;
+none watched the other half of what actually runs on this silicon —
+training. tt-train (`tt-metal/tt-train`, a compiled C++ binary, not a Python
+script) has no dashboard of its own: no Prometheus endpoint, no TensorBoard,
+just plain lines to stdout. Built via `.superpowers/sdd/2026-08-29-training-view/`
+(design doc → 10-task plan → subagent-driven TDD, one task per component,
+each with its own reviewer pass).
+
+### What tt-train actually emits (research against the real source)
+
+Read from `tt-train/sources/examples/nano_gpt/main.cpp`. Per step, on stdout:
+
+```
+Step: {global_step}, Loss: {average_loss}
+Full step time {duration} ms, cache entries: {num_program_cache_entries}
+```
+
+At startup: `Max steps {N}`, `Batch size {N}`, `Gradient accumulation steps
+{N}`, `Scheduler type {name}`, `Number of parameters: {N}`. Checkpoints write
+to a single rolling path from the run's YAML config (e.g.
+`transformer.msgpack`), overwritten in place every `model_save_interval`
+steps — no save-confirmation line is ever printed, so a save is only visible
+as an mtime bump.
+
+**Deliberately not shown, because it is never emitted live**: gradient
+norms, MFU, and a tokens/sec counter. `tt_train_metrics.py` writes a rich
+JSON summary with exactly those fields, but only once, at run end. The view
+derives its own tokens/sec and ETA from the step/loss/step-time lines above
+instead of inventing numbers tt-train never streams.
+
+### Auto-attach — the `/proc/<pid>/fd/1` technique
+
+The view takes no arguments and needs no command. `TrainMonitor::scan_for_process`
+(`src/workload/train/monitor.rs`) walks `/proc`, matching each process's
+`comm`/`cmdline` against `TRAIN_BINARIES = ["nano_gpt", "mnist_mlp",
+"linear_regression"]` (`src/workload/train/detect.rs`) — binary name only,
+never flags, since the flag sets have already drifted across tt-metal
+checkouts. Once a match is found, `readlink /proc/<pid>/fd/1` resolves what
+the process's own stdout points at: if it's a **regular file** (the process
+was launched as `... > train.log`), that file is opened and tailed from the
+current offset — no cooperation from the trainer required, just an OS-level
+lookup by pid. If fd 1 is a **pipe or a tty**, the per-step stream is
+genuinely unrecoverable after the fact; the view says so in plain language
+(training runs, but the visualization can't source per-step numbers, so it
+doesn't draw a fake curve) and falls back to what it can still see —
+process liveness, chip telemetry, and checkpoint mtime.
+Relaunching with stdout redirected to a file fixes it. Checkpoint saves are
+detected the same way HivemindSweeper's `cache_watch` detects compile-cache
+churn: poll the configured checkpoint path's mtime, pulse on change.
+
+### The nine-channel color language
+
+No single hue carries everything — nine independent channels, each a real
+signal: node/mountain hue (magenta 325° → teal 158°, loss magnitude, from
+stdout), amber sweep left→right (forward pass, by step cadence), violet
+sweep right→left (backward pass/gradients, by step cadence), per-column hue
+across the loss range (the whole run's history — a magenta→teal timeline),
+mint▼/coral▲ (loss delta direction, distinct from magnitude), the existing
+cyan→green→amber→red ramp (chip temperature), block density `█▓▒░·` (chip
+power draw), violet shimmer→dim (kernel cache compiling→steady, from the
+cache-entries count), and mint burst + comet (checkpoint saved, from mtime).
+Documented in full in `train_legend_lines` (legend, `l`) and the explain
+overlay (`!`).
+
+### Defects task reviews caught in this feature's own plan
+
+Same pattern this dev log has recorded before (Phase 27's cross-target
+compile break, Phase 31's vacuous security test): the plan and design doc
+were themselves wrong in four places, each caught by a task's review rather
+than by the implementer transcribing correctly:
+
+- **A false auto-attach claim.** The explain overlay's copy (lifted from the
+  design doc) said the view "finds a process holding `/dev/tenstorrent`" —
+  but `scan_for_process` never checks device fds at all, only `comm`/
+  `cmdline` against the three known binary names. Rewritten to describe what
+  the code actually does.
+- **Legend swatches that didn't match the renderer.** The overlay legend's
+  chip-temp/power and aurora color literals were written independently of
+  `train_view.rs`'s own in-app legend (`draw_legend`) and didn't match it —
+  caught by reading the renderer's `entries` array as ground truth and
+  diffing every literal against it. Also split one merged "temp + power"
+  legend line into two, since they're independently-driven signals in the
+  renderer.
+- **A wrong sketch of the existing `v`-cycle.** Task 8's brief gave a
+  simplified `next_display_mode` body that dropped several pre-existing
+  side effects the real cycle handler performs at each transition (e.g.
+  resetting `memory_castle`/`starfield` state) — a plan defect, not a
+  transcription slip, caught by comparing against the actual match arms
+  before refactoring them into the free function.
+- **`CheckpointWatch` swallowed the first save of a fresh run.** The brief's
+  "first poll only establishes a baseline" rule was unconditional, so a
+  checkpoint file that didn't exist yet at attach time — the common case for
+  a fresh launch — had its first real appearance treated as the baseline and
+  silently missed, exactly the save a user watching a new run most wants to
+  see. Fixed with an `existed_at_start` flag captured at construction; a
+  file absent at attach time now pulses on its first successful read, while
+  a pre-existing file keeps the original no-false-pulse-on-attach behavior.
+  TDD'd: the regression test was confirmed to fail (panic) against the
+  pre-fix code before the fix landed.
+
+> ⚠️ **Not hardware-verified.** No box with a real tt-train run was available
+> during development. All parsers are tested against verbatim line shapes
+> from the real `tt-train` source, and the `/proc/<pid>/fd/1` resolution is
+> tested against a real spawned process (not a mock) — but end-to-end
+> attach-to-a-live-run behavior, the honest-degradation path against a
+> genuinely un-redirected trainer, and the checkpoint-comet/aurora-widening
+> visuals under real loss data all remain to be confirmed live, matching how
+> Phase 27's direct-vLLM detection shipped with the same caveat.
+
+---
+
+*Phase 32 status: **COMPLETE, pending hardware verification** — shipped as
+v0.11.0. All 10 plan tasks landed with per-task TDD and review; four plan
+defects (an inaccurate explain claim, mismatched legend swatches, a wrong
+`v`-cycle sketch, and a checkpoint-swallowing edge case) were caught and
+fixed during task review, not discovered later. Full test suite, `cargo fmt
+--check`, and `cargo clippy -D warnings` all green; no real tt-train run
+available to verify against.*
+
+---
+
+## Phase 33 — Recording the Training view, and the bug the recording found (August 30, 2026, v0.11.1)
+
+**Origin**: "record a tt-demo-maker video of the new mode while the demo load
+is running please. but first, can we get the movement a little more fluid."
+
+### Fluidity (v0.11.0 follow-up)
+
+Three causes, the first dominant: `DisplayMode::Training` was missing from
+`is_anim_mode`, so the view redrew at the **10 FPS data rate** rather than the
+~60 FPS animation rate — every moving element was stepping six times slower
+than designed. The forward/backward sweep was also a binary `% period < 2`
+on/off, so cells blinked rather than flowed; it now advances in fractional
+sub-columns with a smoothstepped falloff, a short lead-in ahead of the head
+and a longer tail behind (the asymmetry is what makes direction readable),
+and node glyphs track local sweep intensity instead of a raw frame counter.
+
+Measured while iterating rather than eyeballed: a naive `t²` falloff still
+jumped **0.95** in one frame, because a squared ramp is steepest exactly at
+its peak. Smoothstep has zero derivative at both ends — precisely where the
+pulse most needs to be smooth — bringing the worst-case frame-to-frame change
+under 0.25. Animation rates in `train_sky` are now expressed against
+`ANIM_FPS`, so the 6× frame-rate change bought smoothness without altering
+apparent speed, and re-tuning the tick rate later can't silently speed the
+sky up.
+
+### The bug the demo found
+
+`tt-demo verify` renders a contact sheet so the footage can be checked against
+what its caption claims. Two claims failed, in order:
+
+1. **The first take showed the Insights screen for all 30s.** The manifest's
+   `keys: ["t"]` is parsed *only* to select the asciinema engine — nothing in
+   `tt-demo` ever sends it. Its `raw_script` escape hatch doesn't record either
+   (a documented v1 limitation: `record.rs` prints "run vhs/asciinema
+   manually"). Recorded by driving `lib/tmux_capture.sh` directly with a pane
+   that sends keys to its own `$TMUX_PANE`.
+
+2. **The caption promised "a checkpoint comet on every save" and the comet
+   never fired.** Grepping the cast for the comet's unique mint
+   `RGB(150,235,205)` returned **zero** frames while the checkpoint file's
+   mtime was demonstrably advancing every ten seconds — so this was the
+   product, not the demo. Root cause:
+
+   ```rust
+   self.ckpt = Some(CheckpointWatch::new(PathBuf::from(mp)));
+   ```
+
+   `model_path` is a bare filename in tt-train's own configs
+   (`transformer.msgpack`), written through a plain relative open — so it
+   lands in *the trainer's* cwd. Built verbatim it pointed at whatever
+   directory tt-toplike was launched from, and since `poll()` returns `false`
+   whenever the path can't be stat'd, the pulse stayed silent for the entire
+   run. **The identical wrong-cwd bug had already been fixed for the config
+   path** — `resolve_for_pid` existed and simply wasn't called here.
+
+   Construction moved into `checkpoint_watch_for` so the *wiring* has a seam
+   to test: asserting `resolve_for_pid`'s arithmetic would have passed the
+   whole time, since the defect was that the caller never invoked it. The
+   test spawns a real process with its own cwd and requires a pulse; mutating
+   the resolution back reddens it with exactly the predicted message. After
+   the fix the recording carries 114 comet frames in three bursts matching
+   the ~10.5s save cadence, and the LIVE panel shows `ckpt @ 120` / `ckpt @
+   150` where it previously showed nothing.
+
+**The lesson is the one this repo keeps relearning**: a relative path is
+meaningless without the cwd it was written against, and a watcher on a
+nonexistent path fails *silently and permanently* rather than loudly. It took
+a demo whose caption made a falsifiable claim to notice.
+
+### Recording notes
+
+- `demo/demos.yaml` is committed (the reproducible recipe); `demo/assets/` is
+  gitignored, with published copies in `assets/` and `site/assets/`.
+- `tt-demo render --mp4` hangs past 5 minutes; the mp4 is built directly
+  (`agg --fps-cap 24` → `ffmpeg -r 24 -crf 20`, 1.5 MB) so the fluidity work
+  survives, while the README GIF stays at `--fps-cap 10` (2.7 MB).
+- The demo trainer is a shell stand-in emitting tt-train's verbatim stdout
+  line shapes on a compressed timeline. Its `max_steps` and decay horizon are
+  tuned so the loss is *visibly descending* during the take — an earlier run
+  had flattened at its asymptote and produced a boring plateau.
+- Site gained a `t · training` mode-row (it previously had only a feature
+  card); README gained the GIF in its Training section.
+
+> ⚠️ **Still not hardware-verified.** The recording is a mock backend plus a
+> stand-in trainer. The checkpoint fix is verified against a real process with
+> a real cwd and a real mtime, but attach-to-a-genuine-tt-train-run remains
+> unconfirmed, per Phase 32's caveat.
+
+---
+
+*Phase 33 status: **COMPLETE** — v0.11.1. Fluidity work committed with two
+regression tests (one mutation-tested); one real bug found by verifying demo
+footage against its caption and fixed with a wiring-layer test; 728 tests,
+fmt, clippy, and both cross-targets green.*
+
+---
+
+## Phase 35 — Inference monitor missed a Docker container tagged by tt-model-manager (September 2, 2026, v0.13.3)
+
+**Origin**: user report — "This tool has the inference view mode. It can
+detect vllm and tt-inference-server. it's not detecting a vllm within a
+docker running right now from tt-model-manager." Investigated per
+`superpowers:systematic-debugging` rather than guessing.
+
+**Root cause**: `DockerProbe::list_servers()` (`probe.rs`) enumerates every
+running container via `docker ps`, then hard-gates on
+`detect::is_tt_inference_image(image)` — a substring match against
+`"inference-server"` / `"tt-media-inference"` /
+`"ghcr.io/tenstorrent/tt-*server*"` — **before `docker inspect` is ever
+called**. tt-model-manager tags its images `tt-model/<name>:<hash>` (verified
+live: `tt-model/qwen3-coder-30b-a3b:7c2773460298`), which matches none of
+those patterns, so the container was filtered out no matter what was running
+inside it. `docker inspect` on the real container confirmed a completely
+ordinary `vllm serve` launch — `Entrypoint: ["/usr/local/bin/entrypoint.sh"]`,
+`Cmd: ["vllm", "serve", "Qwen/Qwen3-Coder-30B-A3B-Instruct", ..., "--port",
+"8000"]`, `Devices: [{"PathOnHost": "/dev/tenstorrent", ...}]`, model also
+available as `-e HF_MODEL=...` (no plain `MODEL=` key at all) — the image
+name was simply the wrong signal to gate on.
+
+**Fix** (`detect.rs`, `probe.rs`): factored `parse_direct_vllm`'s (Phase 27)
+host-process launch-shape recognition into shared, token-slice-based helpers
+— `vllm_serve_model`/`is_vllm_launch`/`vllm_model_from_toks` — usable against
+either a split cmdline (host path, unchanged behavior) or a container's
+Entrypoint+Cmd array (`parse_inspect`, new). `parse_inspect` now accepts a
+container when **either** its image matches a known TT pattern (unchanged
+fast path) **or** its Entrypoint+Cmd is vLLM-shaped **and** `HostConfig`
+actually maps `/dev/tenstorrent` — the same TT-evidence discipline Phase 27
+applied to a bare host process (there via `MESH_DEVICE`/`TT_METAL_HOME` in
+`environ`, since a container has no such env-var gate need — its device
+mapping is authoritative and already computed for `uses_tt_device`).
+Model extraction gained an `HF_MODEL` env fallback alongside `MODEL`, since
+`vllm_model_from_toks` also covers the positional `vllm serve <model>` shape
+that a `-e MODEL=` env var was previously required to substitute for.
+`probe.rs`'s `list_servers` pre-filter (avoiding a `docker inspect` call for
+every unrelated container on the box) was widened to also admit a container
+whose plain `docker ps` Command already looks vLLM-shaped — the authoritative
+accept/reject decision still lives in `parse_inspect`.
+
+**Verification**: a new unit test (`parses_model_manager_style_container_by_
+command_shape_not_image`) built from the real `docker inspect` JSON above,
+mutation-tested by temporarily restoring the old image-only gate (confirmed
+red, restored, confirmed green) — plus a paired
+`rejects_vllm_shaped_command_without_a_tt_device_mapping` test (a vLLM-shaped
+container with no device mapping, e.g. plain GPU vLLM, must not be claimed).
+Beyond unit tests: added a temporary `#[ignore]`d smoke test calling
+`DockerProbe::list_servers()` directly against the real Docker daemon on this
+box, confirmed it now returns the tt-model-manager container with the
+correct model/mesh/port, then removed the test (kept only as commit-message
+evidence, not code). User separately confirmed via a manual pass in the live
+TUI. Full suite (828 lib tests), `cargo fmt --check`, `cargo clippy --lib
+--features tui -- -D warnings` all green.
+
+---
+
+*Phase 35 status: **COMPLETE, hardware-verified** — v0.13.3. Root cause
+confirmed live (real `docker inspect` output), fix mutation-tested, detection
+re-verified end-to-end against the real running container, and confirmed
+working by the user in the live TUI.*
+
+---
+
+## Phase 36 — Arcade legend leak + device-labeling consistency (September 2, 2026, v0.13.4)
+
+**Origin**: user report — "Arcade view still shows text and duplicative data
+found in other views on the screen at the same time. This text shouldn't be
+in arcade view: `Showing 4 devices side-by-side │ Particles color-coded by
+device`... Look for chances for consistency in addressing cards. BH0 and WH0
+are great. Dev0 Dev1 Dev2 less so." Classified bounded via
+`superpowers:brainstorming`; scope (full sweep vs. Arcade-only) confirmed
+with the user before touching code.
+
+**Bug**: `MemoryCastle::render()` and `render_compact()` (`memory_castle.rs`)
+each print a standalone-mode legend footer — the only one of that file's
+several duplicated elements never gated behind `self.chrome`, the flag every
+other embedded-vs-standalone distinction in the file already respects (the
+per-device W/°C readout, the single-device detail line, …). Arcade sets
+`chrome=false` specifically so its own strip/legend own that information; the
+ungated footer leaked through anyway. Fixed by wrapping both footers (text
++ their separator rule) in `if self.chrome`.
+
+**Consistency audit**: a survey across every animation/TUI view found six
+different device-labeling conventions in concurrent use: `BH0`/`WH0` (arch
+abbrev + index, no separator — Arcade's topology strip, the one the user
+liked), `Dev0`/`Dev N`, `D{n}`, `Device N: BH`, a bare numeral, and the full
+uppercase architecture name paired separately with `D{n}` (chip portrait).
+Several of these are visible on Arcade's own composited screen
+simultaneously, since it stacks Memory Castle + Starfield + Flow + its own
+strip in one view.
+
+Added `Device::short_label()` (`src/models/device.rs`, next to the existing
+`Device::name()`) returning the `"BH0"`/`"WH2"`/`"GS1"` form, and adopted it
+at every site with room for it:
+- `arcade.rs`'s `telemetry_strip` — the one place Arcade prints per-device
+  W/°C, so the single highest-value fix.
+- `memory_castle.rs`'s Full-tier and Compact-tier per-device column headers.
+- The 32+-chip fleet-grid row label — changed from a fixed `"Dev {:2} {} "`
+  (dev-index-then-arch, 10 cols) to a fixed-width `"{:<5}"` around
+  `short_label()` (arch-then-index, ≤5 cols) so the power bar that follows
+  still lines up down the column regardless of index digit count.
+- The standalone single-device title bar (`"Device 0: BH"` → `"BH0"`).
+
+**Bonus fix caught in passing**: while touching the Compact tier's header,
+found it was still labeling by loop position (`idx` from `.enumerate()`)
+rather than `device.index` — the exact sparse-index mis-attribution bug
+(a salvaged tt-smi snapshot that drops a malformed `device_info[]` entry, or
+an ARC-dead chip) the Full tier's own header comment already documents
+having been fixed for. Fixed the same way here, with a dedicated regression
+test built from a sparse two-device snapshot (indices 1 and 2) asserting the
+header names `BH1`/`BH2`, not a position-keyed `BH0`/`BH1`.
+
+**Deliberately left alone**, each with an inline comment explaining why
+rather than silently skipped:
+- `mod.rs`'s TRON/32+-chip fleet-grid bare numeral and `hivemind_view.rs`'s
+  `D{d}` sidebar columns — both tiers purpose-built to cram many chips/rows
+  into a minimal per-cell width budget; a 2-3 char label addition could
+  break that budget for the chip counts (32+) those tiers exist for.
+- The chip portrait header (`mod.rs`) — already prints the full uppercase
+  architecture name once per chip; adding `BH` too would be the repetition
+  this pass exists to remove, not a fix.
+- The kill-confirm dialog's `"Dev N"` (`mod.rs`) — a modal, never shown
+  alongside the other conventions at once, and getting architecture into it
+  needs a small signature change for low value.
+
+**Verification**: two new regression tests, both mutation-tested (reverted
+the fix, confirmed the test fails with the exact predicted wrong text,
+restored) — `embedded_chrome_off_suppresses_the_side_by_side_footer_text`
+(covers both Full and Compact tiers, plus a positive assertion that
+standalone/chrome-on still shows the footer) and
+`compact_tier_header_uses_device_index_not_list_position`. Full suite (831
+lib tests), `cargo fmt --check`, `cargo clippy --lib --features tui -- -D
+warnings` all green. Rebuilt and installed the release binaries; user
+confirmed the swap.
+
+---
+
+*Phase 36 status: **COMPLETE** — v0.13.4. Both fixes mutation-tested; full
+suite/fmt/clippy green; binaries rebuilt and installed on the live box.*

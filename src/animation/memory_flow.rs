@@ -195,6 +195,12 @@ pub struct MemoryFlowVis {
     /// Grid dimensions (architecture-specific)
     grid_rows: usize,
     grid_cols: usize,
+
+    /// Emit the power/temperature fields in the fleet stats line.  `true` for
+    /// the standalone Memory Flow mode (default, byte-identical to today);
+    /// Arcade sets this `false` so the composite view owns a single shared
+    /// telemetry strip instead of each embedded section printing W/°C.
+    chrome: bool,
 }
 
 impl MemoryFlowVis {
@@ -216,7 +222,16 @@ impl MemoryFlowVis {
             core_heat: vec![0.0; 16 * 14], // Max size (Blackhole)
             grid_rows: 0,
             grid_cols: 0,
+            chrome: true,
         }
+    }
+
+    /// Toggle the power/temp fields in the fleet stats line.  `true` = the
+    /// standalone look (default); `false` drops the W/°C fields (particle and
+    /// current stats stay) so a composite view (Arcade) can render one shared
+    /// telemetry strip.
+    pub fn set_chrome(&mut self, chrome: bool) {
+        self.chrome = chrome;
     }
 
     /// Set the animation sensitivity multiplier.
@@ -300,7 +315,9 @@ impl MemoryFlowVis {
                 let read_rate = (power / 150.0).min(1.0);
                 let pseudo_r = ((self.frame * 73 + fleet_pos as u32 * 31) % 100) as f32 / 100.0;
                 if pseudo_r < read_rate && device_particle_count < device_budget {
-                    let num_ch = device.architecture.memory_channels();
+                    // `.max(1)` guards 0-channel devices (Host/CPU backend's
+                    // `Architecture::Unknown`) against a divide-by-zero panic.
+                    let num_ch = device.memory_channels().max(1);
                     let channel = (self.frame as usize + fleet_pos * 7) % num_ch;
                     let mut p = MemoryFlowParticle::new_read(
                         channel,
@@ -324,7 +341,9 @@ impl MemoryFlowVis {
                 let write_rate = (current / 100.0).min(1.0).max(mvddq_rate * 0.6);
                 let pseudo_w = ((self.frame * 97 + fleet_pos as u32 * 43) % 100) as f32 / 100.0;
                 if pseudo_w < write_rate * 0.5 && device_particle_count < device_budget {
-                    let num_ch = device.architecture.memory_channels();
+                    // `.max(1)` guards 0-channel devices (Host/CPU backend's
+                    // `Architecture::Unknown`) against a divide-by-zero panic.
+                    let num_ch = device.memory_channels().max(1);
                     let channel = (self.frame as usize + fleet_pos * 7 + num_ch / 2) % num_ch;
                     let mut p = MemoryFlowParticle::new_write(
                         channel,
@@ -410,7 +429,7 @@ impl MemoryFlowVis {
 
         // Use the first device's architecture for channel count and smbus DDR status.
         let arch_device = &devices[0];
-        let ddr_channels = arch_device.architecture.memory_channels();
+        let ddr_channels = arch_device.memory_channels();
         let smbus = backend.smbus_telemetry(arch_device.index);
 
         // Synthetic aggregate telemetry for the DDR bar helpers.
@@ -459,6 +478,47 @@ impl MemoryFlowVis {
             .collect()
     }
 
+    /// Map real per-channel `gddr_telemetry` state onto the same status
+    /// vocabulary `parse_ddr_status` produces from the packed bitmask
+    /// (0=idle/untrained, 1=training, 2=trained, >2=error), so the existing
+    /// render match in `render_ddr_channels_top_agg`/`bottom_agg` needs no
+    /// changes. `gddr_telemetry` has no "currently training" signal (only a
+    /// post-hoc pass/fail), so this source never emits `1` — that state
+    /// stays reachable only via the bitmask fallback.
+    fn channel_status_from_gddr_telemetry(
+        g: &crate::models::telemetry::GddrTelemetry,
+        num_channels: usize,
+    ) -> Vec<u8> {
+        (0..num_channels)
+            .map(|i| {
+                g.channels.iter().find(|c| c.channel == i).map_or(0, |c| {
+                    if c.harvested || !c.enabled {
+                        0
+                    } else if !c.training_pass || !c.bist_pass {
+                        3
+                    } else {
+                        2
+                    }
+                })
+            })
+            .collect()
+    }
+
+    /// Real `gddr_telemetry` state when present (tt-smi ≥ 6.3.0), else the
+    /// packed `DDR_STATUS` bitmask decode (`parse_ddr_status`).
+    fn channel_status(
+        smbus: Option<&crate::models::SmbusTelemetry>,
+        num_channels: usize,
+    ) -> Vec<u8> {
+        match smbus
+            .and_then(|s| s.gddr_telemetry.as_ref())
+            .filter(|g| !g.channels.is_empty())
+        {
+            Some(g) => Self::channel_status_from_gddr_telemetry(g, num_channels),
+            None => Self::parse_ddr_status(smbus, num_channels),
+        }
+    }
+
     /// Render top DDR channels — fleet aggregate version.
     fn render_ddr_channels_top_agg(
         &self,
@@ -478,7 +538,7 @@ impl MemoryFlowVis {
         ));
 
         let channel_width = (self.width.saturating_sub(15)) / num_channels.max(1);
-        let channel_status = Self::parse_ddr_status(smbus, num_channels);
+        let channel_status = Self::channel_status(smbus, num_channels);
 
         for ch in 0..num_channels {
             let status = channel_status.get(ch).copied().unwrap_or(0);
@@ -638,7 +698,7 @@ impl MemoryFlowVis {
         ));
 
         let channel_width = (self.width.saturating_sub(15)) / num_channels.max(1);
-        let channel_status = Self::parse_ddr_status(smbus, num_channels);
+        let channel_status = Self::channel_status(smbus, num_channels);
 
         for ch in 0..num_channels {
             let status = channel_status.get(ch).copied().unwrap_or(0);
@@ -708,14 +768,26 @@ impl MemoryFlowVis {
         } else {
             format!("{}×{}", n, devices[0].architecture.abbrev())
         };
-        let stats = format!(
-            " {} | particles:{:3} | power:{:5.1}W | temp:{:3.0}°C | current:{:5.1}A",
-            arch_label,
-            self.particles.len(),
-            total_power,
-            avg_temp,
-            total_current,
-        );
+        // Standalone shows the full stats line; embedded (chrome off) drops the
+        // power/temp fields — those are owned by the Arcade shared strip — while
+        // keeping the flow-specific particle count and current draw.
+        let stats = if self.chrome {
+            format!(
+                " {} | particles:{:3} | power:{:5.1}W | temp:{:3.0}°C | current:{:5.1}A",
+                arch_label,
+                self.particles.len(),
+                total_power,
+                avg_temp,
+                total_current,
+            )
+        } else {
+            format!(
+                " {} | particles:{:3} | current:{:5.1}A",
+                arch_label,
+                self.particles.len(),
+                total_current,
+            )
+        };
         Line::from(vec![Span::styled(
             stats,
             Style::default()
@@ -733,5 +805,91 @@ impl MemoryFlowVis {
     /// Get mode name
     pub fn mode_name(&self) -> &'static str {
         "Memory Flow"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::host::HostBackend;
+    use crate::backend::TelemetryBackend;
+
+    /// Regression: same zero-channel divide-by-zero as Memory Castle. The Host
+    /// backend's `Architecture::Unknown` device reports 0 memory channels, and
+    /// the read/write particle spawn paths did `frame % num_ch`. Arcade embeds
+    /// Memory Flow, so this panicked too. update() must tolerate 0 channels.
+    #[test]
+    fn update_survives_zero_channel_device() {
+        let mut backend = HostBackend::new();
+        backend.init().expect("host backend init");
+        backend.update().expect("host backend update");
+
+        let mut flow = MemoryFlowVis::new(80, 24);
+        for _ in 0..10 {
+            flow.update(&backend);
+        }
+    }
+
+    #[test]
+    fn channel_status_prefers_real_gddr_telemetry_over_bitmask() {
+        use crate::models::telemetry::{GddrChannel, GddrTelemetry, SmbusTelemetry};
+        let smbus = SmbusTelemetry {
+            // Bitmask says "all trained" (nibble 2 repeated) — if this were used,
+            // every channel would show status 2. gddr_telemetry disagrees, and
+            // must win.
+            ddr_status: Some("0x22222222".to_string()),
+            gddr_telemetry: Some(GddrTelemetry {
+                speed: None,
+                max_temp: None,
+                enabled_mask: None,
+                channels: vec![
+                    GddrChannel {
+                        channel: 0,
+                        harvested: true,
+                        enabled: false,
+                        training_pass: false,
+                        bist_pass: true,
+                        ..Default::default()
+                    },
+                    GddrChannel {
+                        channel: 1,
+                        harvested: false,
+                        enabled: true,
+                        training_pass: true,
+                        bist_pass: false,
+                        ..Default::default()
+                    },
+                    GddrChannel {
+                        channel: 2,
+                        harvested: false,
+                        enabled: true,
+                        training_pass: true,
+                        bist_pass: true,
+                        ..Default::default()
+                    },
+                ],
+            }),
+            ..Default::default()
+        };
+        let status = MemoryFlowVis::channel_status(Some(&smbus), 3);
+        assert_eq!(status[0], 0, "harvested channel reads as idle, not trained");
+        assert_eq!(
+            status[1], 3,
+            "BIST failure is a distinct error code, not the generic bitmask error"
+        );
+        assert_eq!(status[2], 2, "healthy enabled channel reads as trained");
+    }
+
+    #[test]
+    fn channel_status_falls_back_to_bitmask_when_gddr_telemetry_absent() {
+        use crate::models::telemetry::SmbusTelemetry;
+        let smbus = SmbusTelemetry {
+            ddr_status: Some("0x00000012".to_string()), // channel0=trained(2), channel1=idle(0), channel... etc per nibble
+            gddr_telemetry: None,
+            ..Default::default()
+        };
+        let status = MemoryFlowVis::channel_status(Some(&smbus), 2);
+        assert_eq!(status[0], 2);
+        assert_eq!(status[1], 1);
     }
 }

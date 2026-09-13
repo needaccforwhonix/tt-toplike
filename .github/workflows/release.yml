@@ -5,9 +5,18 @@ on:
     tags:
       - 'v*'
   workflow_dispatch:
+    inputs:
+      build_macos:
+        description: "Also build the macOS universal binary (uses a costly macOS runner)"
+        type: boolean
+        default: false
+      build_windows:
+        description: "Also build the Windows x86_64 binary"
+        type: boolean
+        default: false
 
 permissions:
-  contents: write   # upload release assets and push gh-pages
+  contents: write   # upload release assets
 
 jobs:
   # ── Build .deb packages for each supported Ubuntu suite ────────────────────
@@ -96,39 +105,131 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --clobber
 
-  # ── Update site/ in main and let deploy-site.yml publish it ─────────────────
-  update-site:
-    name: Update project site
-    runs-on: ubuntu-24.04
-    needs: build-deb
-    if: startsWith(github.ref, 'refs/tags/v')
-    permissions:
-      contents: write
+  # ── Build a universal macOS binary (experimental --host preview) ───────────
+  #
+  # macOS can't be cross-compiled from the Linux runners above: the host
+  # backend links the private IOReport framework (src/backend/ane_macos.rs) and
+  # CoreFoundation, and shells out to `ioreg`, so it needs the real macOS SDK
+  # and linker. We build natively on a macos-14 (Apple Silicon) runner instead.
+  #
+  # A single runner produces a UNIVERSAL binary: we build both arches (the SDK
+  # carries both framework slices, so cross-arch linking within macOS works)
+  # and fuse them with `lipo`. The result is the TUI binary only — no .deb, no
+  # GUI app, and it is UNSIGNED/UNNOTARIZED, so first launch hits a Gatekeeper
+  # prompt (right-click → Open, or `xattr -dr com.apple.quarantine <bin>`).
+  build-macos:
+    name: Build macOS (universal)
+    runs-on: macos-14
+    # Only spend costly macOS-runner minutes for real tagged releases, or when a
+    # manual dispatch explicitly opts in (build_macos=true). A bare workflow_dispatch
+    # no longer builds this by default.
+    if: startsWith(github.ref, 'refs/tags/v') || github.event.inputs.build_macos == 'true'
 
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: main   # site/ lives on main; tag may point to a release branch
 
-      - name: Update version in site/index.html
+      - name: Add Rust targets (arm64 + x86_64)
+        run: |
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      # --no-default-features drops linux-procfs (its procfs dep is Linux-only);
+      # tui + json-backend match the README build line. The host backend and
+      # Apple GPU/ANE devices are always compiled — no feature flag needed.
+      - name: Build TUI for both arches
+        run: |
+          for target in aarch64-apple-darwin x86_64-apple-darwin; do
+            cargo build --release --locked --target "$target" \
+              --bin tt-toplike-tui \
+              --no-default-features --features tui,json-backend
+          done
+
+      - name: Fuse into a universal binary
+        run: |
+          mkdir -p dist
+          lipo -create -output dist/tt-toplike-tui \
+            target/aarch64-apple-darwin/release/tt-toplike-tui \
+            target/x86_64-apple-darwin/release/tt-toplike-tui
+          lipo -info dist/tt-toplike-tui
+
+      - name: Package tarball
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
-          REPO="${GITHUB_REPOSITORY}"
+          [ -n "$VERSION" ] || VERSION="dev"   # workflow_dispatch has no tag
+          cp LICENSE NOTICE README.md dist/
+          TARBALL="tt-toplike-tui-${VERSION}-macos-universal.tar.gz"
+          tar -C dist -czf "$TARBALL" .
+          echo "TARBALL=$TARBALL" >> "$GITHUB_ENV"
+          shasum -a 256 "$TARBALL"
 
-          sed -i "s|Tenstorrent Hardware Monitor · v[0-9]*\.[0-9]*\.[0-9]* · Rust|Tenstorrent Hardware Monitor · v${VERSION} · Rust|g" \
-            site/index.html
-
-          sed -Ei "s|(gh release download )--repo [^ ]*|\1--repo ${REPO}|g" \
-            site/index.html
-
-      - name: Commit updated site
+      - name: Ensure release exists, then upload tarball
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git config user.name  "github-actions[bot]"
-          if git diff --quiet; then
-            echo "No site changes needed."
+          # Matrix .deb jobs may create the release first; create only if absent
+          # (same race-tolerant pattern as build-deb).
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $GITHUB_REF_NAME already exists — skipping create."
           else
-            git add site/index.html
-            git commit -m "site: bump to ${GITHUB_REF_NAME}"
-            git push origin main
+            gh release create "$GITHUB_REF_NAME" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$GITHUB_REF_NAME" \
+              --generate-notes \
+              --verify-tag
           fi
+
+          gh release upload "$GITHUB_REF_NAME" \
+            "$TARBALL" \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber
+
+  # ── Build the Windows x86_64 binary (experimental --host preview) ──────────
+  #
+  # Native build on a windows-latest runner (x86_64-pc-windows-msvc). We ship the
+  # TUI only — same safe feature set that cross-compiles cleanly (tui + json-backend,
+  # no linux-procfs). The headless `--bench` smoke gives runtime proof on real
+  # Windows (it exercises sysinfo's PDH path that Wine can't emulate); a failure
+  # there fails the job before we publish anything.
+  build-windows:
+    name: Build Windows (x86_64)
+    runs-on: windows-latest
+    # Only build on tagged releases or an opt-in manual dispatch.
+    if: startsWith(github.ref, 'refs/tags/v') || github.event.inputs.build_windows == 'true'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build TUI (release)
+        run: cargo build --release --locked --bin tt-toplike-tui --no-default-features --features tui,json-backend
+
+      - name: Runtime smoke (headless --bench)
+        run: cargo run --release --locked --bin tt-toplike-tui --no-default-features --features tui,json-backend -- --bench --mock
+
+      - name: Package zip
+        shell: pwsh
+        run: |
+          $version = "${{ github.ref_name }}" -replace '^v', ''
+          if (-not $version) { $version = "dev" }
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item target/release/tt-toplike-tui.exe dist/
+          Copy-Item LICENSE, NOTICE, README.md dist/
+          $zip = "tt-toplike-tui-$version-windows-x86_64.zip"
+          Compress-Archive -Path dist/* -DestinationPath $zip -Force
+          "ZIP=$zip" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Get-FileHash $zip -Algorithm SHA256
+
+      - name: Ensure release exists, then upload zip
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          # Race-tolerant: another build job may create the release first.
+          gh release view $env:GITHUB_REF_NAME --repo $env:GITHUB_REPOSITORY *> $null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $env:GITHUB_REF_NAME --repo $env:GITHUB_REPOSITORY --title $env:GITHUB_REF_NAME --generate-notes --verify-tag
+          }
+          gh release upload $env:GITHUB_REF_NAME $env:ZIP --repo $env:GITHUB_REPOSITORY --clobber

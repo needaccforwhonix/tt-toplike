@@ -465,7 +465,7 @@
       margin-top: 0.15rem;
     }
 
-    .install-body { flex: 1; }
+    .install-body { flex: 1; min-width: 0; }
 
     .install-body p {
       font-size: 0.93rem;
@@ -543,6 +543,22 @@
       color: var(--text);
       margin-bottom: 0.6rem;
       line-height: 1.25;
+    }
+
+    .mode-badge {
+      display: inline-block;
+      vertical-align: middle;
+      font-family: var(--mono);
+      font-size: 0.62rem;
+      font-weight: 500;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      padding: 0.1em 0.5em;
+      margin-left: 0.5em;
+      background: rgba(244, 196, 113, 0.1);
+      border: 1px solid rgba(244, 196, 113, 0.4);
+      border-radius: 4px;
+      color: #F4C471;
     }
 
     .mode-desc {
@@ -751,7 +767,7 @@
 ·∘○◉         ●◉○∘·∘○◉●
 ◉●∘·  ·∘○◉●◉○∘·  ·∘○◉</div>
 
-      <p class="hero-eyebrow">Tenstorrent Hardware Monitor · v0.6.2 · Rust</p>
+      <p class="hero-eyebrow">Tenstorrent Hardware Monitor · v0.13.4 · Rust</p>
 
       <h1 class="hero-title">
         Watch<br>
@@ -902,6 +918,18 @@
       </p>
     </div>
     <div class="feature-card">
+      <div class="feature-icon">⇅</div>
+      <p class="feature-title">PCIe Link Traffic</p>
+      <p class="feature-desc">
+        The driver keeps twelve data-word counters on the PCIe link, split by
+        direction and initiator. tt-toplike folds them into inbound and outbound
+        totals and differentiates them every tick, so the Insights panel shows the
+        link's geometry — <code>Gen4 x4</code> — above live ▼/▲ byte rates.
+        That's the host↔chip pipe itself: weights streaming in at load time,
+        activations and results coming back during inference.
+      </p>
+    </div>
+    <div class="feature-card">
       <div class="feature-icon">@</div>
       <p class="feature-title">Arcade Hero</p>
       <p class="feature-desc">
@@ -911,18 +939,30 @@
         moving through DDR, L2, L1, and Tensix as the workload climbs.
       </p>
     </div>
+    <div class="feature-card">
+      <div class="feature-icon">△</div>
+      <p class="feature-title">Training</p>
+      <p class="feature-desc">
+        Watch a model learn. tt-toplike finds a running tt-train job on its
+        own and draws it as the network it is: tokens streaming in, gradients
+        washing back, and a range of loss mountains under an aurora that
+        widens as the model converges.
+      </p>
+    </div>
   </div>
 </section>
 
 <!-- ── Modes ──────────────────────────────────────────────────────────────── -->
 <section class="section edge" id="modes">
   <p class="section-label">Visualization modes</p>
-  <h2 class="section-heading">Seven ways to watch your hardware think</h2>
+  <h2 class="section-heading">Nine ways to watch your hardware think</h2>
   <p class="section-sub">
     Press <code>v</code> to cycle, or jump directly with <code>a</code> (Arcade),
-    <code>d</code> (Defrag), <code>g</code> (Insights). Every mode reads the same
-    live telemetry — power, temperature, aiclk, DDR state — and renders it differently.
-    Recordings below are from real 4× Blackhole hardware.
+    <code>d</code> (Defrag), <code>g</code> (Insights), <code>i</code> (Inference
+    Server Monitor), or <code>~</code> (HivemindSweeper). Every mode reads the same
+    live telemetry — power, temperature, aiclk, DDR state — and renders it
+    differently. Recordings below are from real 4× Blackhole hardware during live
+    LLM inference.
   </p>
 
   <div class="modes-grid">
@@ -946,7 +986,8 @@
           <span class="mode-hint"><kbd>!</kbd> explain</span>
         </div>
       </div>
-      <img src="assets/gifs/01-insights.gif" alt="Insights mode demo" class="mode-gif" loading="lazy">
+      <video class="mode-gif" src="assets/gifs/01-insights.webm" autoplay muted loop playsinline
+             aria-label="Insights mode demo"></video>
     </div>
 
     <hr class="mode-divider">
@@ -968,7 +1009,8 @@
           <span class="mode-hint"><kbd>!</kbd> explain signals</span>
         </div>
       </div>
-      <img src="assets/gifs/02-starfield.gif" alt="Starfield mode demo" class="mode-gif" loading="lazy">
+      <video class="mode-gif" src="assets/gifs/02-starfield.webm" autoplay muted loop playsinline
+             aria-label="Starfield mode demo"></video>
     </div>
 
     <hr class="mode-divider">
@@ -990,7 +1032,8 @@
           <span class="mode-hint"><kbd>!</kbd> explain signals</span>
         </div>
       </div>
-      <img src="assets/gifs/03-memory-castle.gif" alt="Memory Castle mode demo" class="mode-gif" loading="lazy">
+      <video class="mode-gif" src="assets/gifs/03-memory-castle.webm" autoplay muted loop playsinline
+             aria-label="Memory Castle mode demo"></video>
     </div>
 
     <hr class="mode-divider">
@@ -1013,7 +1056,8 @@
           <span class="mode-hint"><kbd>!</kbd> explain signals</span>
         </div>
       </div>
-      <img src="assets/gifs/04-memory-flow.gif" alt="Memory Flow mode demo" class="mode-gif" loading="lazy">
+      <video class="mode-gif" src="assets/gifs/04-memory-flow.webm" autoplay muted loop playsinline
+             aria-label="Memory Flow mode demo"></video>
     </div>
 
     <hr class="mode-divider">
@@ -1038,7 +1082,8 @@
           <span class="mode-hint"><kbd>!</kbd> explain signals</span>
         </div>
       </div>
-      <img src="assets/gifs/05-defrag.gif" alt="Defrag mode demo" class="mode-gif" loading="lazy">
+      <video class="mode-gif" src="assets/gifs/05-defrag.webm" autoplay muted loop playsinline
+             aria-label="Defrag mode demo"></video>
     </div>
 
     <hr class="mode-divider">
@@ -1053,7 +1098,10 @@
           block map side-by-side (middle 30%), Memory Flow (bottom 30%).
           A <code>@</code> hero character roams the canvas — X position = current draw,
           Y position = power, color = temperature, speed and trail length = aiclk and
-          ETH link count. The fullest picture of what your hardware is doing.
+          ETH link count. The fullest picture of what your hardware is doing. And when a
+          model is serving locally, the hero squares off against the inference snake in a
+          telemetry-true tug-of-war — the <code>⚔</code> marker slides toward whichever
+          side dominates (chip power vs tokens/s and queue depth).
         </p>
         <div class="mode-hints">
           <span class="mode-hint"><kbd>a</kbd> jump here directly</span>
@@ -1061,7 +1109,176 @@
           <span class="mode-hint"><kbd>!</kbd> explain signals</span>
         </div>
       </div>
-      <img src="assets/gifs/06-arcade.gif" alt="Arcade mode demo" class="mode-gif" loading="lazy">
+      <video class="mode-gif" src="assets/gifs/11-arcade-duel.webm" autoplay muted loop playsinline
+             aria-label="Arcade mode — the hero character duels the inference snake while a model serves"></video>
+    </div>
+
+    <hr class="mode-divider">
+
+    <!-- Inference Server Monitor — cold -->
+    <div class="mode-row">
+      <div class="mode-meta">
+        <span class="mode-key">i · cold</span>
+        <p class="mode-title">Inference Monitor — waiting</p>
+        <p class="mode-desc">
+          Press <code>i</code> for the Inference Server Monitor: one "snake" that threads
+          through every state of a tt-inference-server. Idle, a hungry snake roams a
+          starfield of the model catalog — each star a model that runs on your
+          architecture. The screensaver, waiting for work to arrive.
+        </p>
+        <div class="mode-hints">
+          <span class="mode-hint"><kbd>i</kbd> inference monitor</span>
+          <span class="mode-hint"><kbd>l</kbd> legend</span>
+        </div>
+      </div>
+      <video class="mode-gif" src="assets/gifs/08-inference-cold.webm" autoplay muted loop playsinline
+             aria-label="Inference monitor cold state — snake roaming the model-catalog starfield"></video>
+    </div>
+
+    <hr class="mode-divider">
+
+    <!-- Inference Server Monitor — loading -->
+    <div class="mode-row">
+      <div class="mode-meta">
+        <span class="mode-key">i · loading</span>
+        <p class="mode-title">Inference Monitor — loading</p>
+        <p class="mode-desc">
+          When a model loads, the snake coils and grows through the compile → load → ready
+          journey, shaded with classic ANSI block-ramp gradients. This is the wait the
+          tool was born to fill: concrete evidence of progress instead of a silent log
+          during a long first-run kernel compile.
+        </p>
+        <div class="mode-hints">
+          <span class="mode-hint"><kbd>i</kbd> inference monitor</span>
+        </div>
+      </div>
+      <video class="mode-gif" src="assets/gifs/09-inference-load.webm" autoplay muted loop playsinline
+             aria-label="Inference monitor loading state — ANSI block-shaded loading animation"></video>
+    </div>
+
+    <hr class="mode-divider">
+
+    <!-- Inference Server Monitor — serving -->
+    <div class="mode-row">
+      <div class="mode-meta">
+        <span class="mode-key">i · serving</span>
+        <p class="mode-title">Inference Monitor — serving</p>
+        <p class="mode-desc">
+          Once serving, it becomes a live dashboard driven by the vLLM
+          <code>/metrics</code> endpoint and per-chip telemetry: a throughput timeline,
+          the token-exhaust snake, request swimlanes (queue → prefill → decode), a stats
+          panel, and a silicon strip correlating tokens with real power and temperature.
+        </p>
+        <div class="mode-hints">
+          <span class="mode-hint"><kbd>i</kbd> inference monitor</span>
+          <span class="mode-hint"><kbd>l</kbd> legend</span>
+          <span class="mode-hint"><kbd>!</kbd> explain signals</span>
+        </div>
+      </div>
+      <video class="mode-gif" src="assets/gifs/10-inference-serving.webm" autoplay muted loop playsinline
+             aria-label="Inference monitor serving state — live vLLM dashboard"></video>
+    </div>
+
+    <hr class="mode-divider">
+
+    <!-- Grayskull theme -->
+    <div class="mode-row">
+      <div class="mode-meta">
+        <span class="mode-key">/theme grayskull</span>
+        <p class="mode-title">Grayskull theme</p>
+        <p class="mode-desc">
+          Type <code>/theme grayskull</code> to collapse the whole palette, app-wide, to
+          a thousand shades of grey — with a cyan tint for cool signals, a little purple,
+          and hot pink as the only truly hot color. Shown here over the Arcade duel.
+          <code>/theme default</code> restores full color.
+        </p>
+        <div class="mode-hints">
+          <span class="mode-hint"><kbd>/theme grayskull</kbd></span>
+          <span class="mode-hint"><kbd>/theme default</kbd></span>
+        </div>
+      </div>
+      <video class="mode-gif" src="assets/gifs/12-arcade-grayskull.webm" autoplay muted loop playsinline
+             aria-label="Grayskull theme — the arcade duel rendered in grayscale with hot-pink accents"></video>
+    </div>
+
+    <hr class="mode-divider">
+
+    <!-- HivemindSweeper -->
+    <div class="mode-row">
+      <div class="mode-meta">
+        <span class="mode-key">~ · hivemind</span>
+        <p class="mode-title">HivemindSweeper</p>
+        <p class="mode-desc">
+          An opt-in, read-only activity sniffer for <em>"what's touching my hardware
+          right now — and is it making progress?"</em> — built for when the
+          interesting work isn't logging where you're watching. It folds driver
+          messages, tt-metal compile-cache churn, <code>/proc</code> device-fd
+          activity, log tails (incl. <code>docker logs</code>), and the tt-metal
+          Inspector into one <em>source × device</em> board and a coalesced feed:
+          repeats collapse to a single row with a live count, rate, and sparkline —
+          <code>metal · ncrisc.elf ×136</code>, <code>vLLM · holding …</code>,
+          serving throughput dug out of DEBUG logs. The red KITT scanner slows and
+          focuses as activity climbs.
+        </p>
+        <div class="mode-hints">
+          <span class="mode-hint"><kbd>f</kbd> unified feed</span>
+          <span class="mode-hint"><kbd>s</kbd> severity floor</span>
+          <span class="mode-hint"><kbd>/watch</kbd> · <kbd>/wrap</kbd> point at a target</span>
+          <span class="mode-hint"><kbd>l</kbd> legend</span>
+        </div>
+      </div>
+      <img class="mode-gif" src="assets/tt-toplike-hivemindsweeper.gif"
+           alt="HivemindSweeper demo — vLLM serving throughput, device-holder heartbeats, and tt-metal kernel compiles coalesced into one source × device feed on 4× Blackhole"
+           loading="lazy">
+    </div>
+
+    <hr class="mode-divider">
+
+    <!-- Training -->
+    <div class="mode-row">
+      <div class="mode-meta">
+        <span class="mode-key">t · training</span>
+        <p class="mode-title">Training</p>
+        <p class="mode-desc">
+          Watch a model learn. No flags, no config, no target to name — it finds a
+          live <a href="https://github.com/tenstorrent/tt-metal/tree/main/tt-train">tt-train</a>
+          run, resolves <code>/proc/&lt;pid&gt;/fd/1</code> to the log that process is
+          already writing, and starts tailing it. The model is drawn as the network
+          it is — one column per transformer block, one node per attention head —
+          with amber sweeps for the forward pass and violet for backward. Below,
+          a loss <em>mountain range</em> descends as the run converges, each column
+          keeping its own loss's hue so the range doubles as a run-history timeline,
+          under an aurora-and-starfield sky that widens as the loss drops. A comet
+          crosses that sky on every checkpoint save.
+        </p>
+        <p class="mode-desc">
+          Deliberately honest about its limits: it draws only what a run actually
+          emits, so gradient norms and MFU — which exist only in a run-end summary —
+          are simply not drawn. If the trainer's stdout went to a pipe or a tty
+          rather than a file, the per-step stream is genuinely unrecoverable, and the
+          view says so instead of inventing a curve.
+        </p>
+        <p class="mode-desc">
+          The clip above is one unedited take: a real LoRA fine-tune of a 123.3M-parameter
+          model on 2× p300c Blackhole, 3,000 steps, with the trainer on the left and
+          <code>tt-toplike --mode training</code> on the right. The view resolved the run's
+          shape from its log alone — 8 blocks × 16 heads, d_model 1024, vocab 32000,
+          seq 512, batch 8 — and derives <strong>42,279 tok/s</strong> from it. The hue ramp
+          is scaled to <code>ln(vocab_size)</code>, the cross-entropy of a uniform
+          distribution and so the worst score a run can post; against a fixed anchor the
+          entire early phase, where loss falls fastest, collapsed into one flat red.
+        </p>
+        <div class="mode-hints">
+          <span class="mode-hint"><kbd>t</kbd> from any view</span>
+          <span class="mode-hint"><code>--mode training</code> to launch into it</span>
+          <span class="mode-hint"><kbd>Esc</kbd> back</span>
+          <span class="mode-hint"><kbd>l</kbd> legend</span>
+        </div>
+      </div>
+      <video class="mode-gif" src="assets/tt-toplike-training-lora.mp4"
+             poster="assets/tt-toplike-training-lora.png"
+             autoplay loop muted playsinline
+             aria-label="Training view beside a live LoRA fine-tune on Blackhole: the trainer streams on the left while the right pane shows the resolved model card, live tokens per second, and a loss mountain range shaded pink through violet to deep blue"></video>
     </div>
 
     <hr class="mode-divider">
@@ -1070,20 +1287,31 @@
     <div class="mode-row">
       <div class="mode-meta">
         <span class="mode-key">--host</span>
-        <p class="mode-title">Host CPU mode</p>
+        <p class="mode-title">Host CPU mode <span class="mode-badge">experimental</span></p>
         <p class="mode-desc">
-          No Tenstorrent hardware? Run <code>tt-toplike --host</code> on any Linux
-          machine. CPU frequency maps to aiclk, package temperature to die temp,
-          RAM usage to DDR fill. Every visualization works — your CPU cores glow
-          as stars, your RAM drives the DDR channel bars. A useful way to explore
-          all modes before TT hardware arrives.
+          No Tenstorrent hardware yet? Run <code>tt-toplike --host</code> on
+          Linux or macOS (Windows builds + tests in CI; runtime not yet validated). CPU frequency maps to aiclk, package
+          temperature to die temp, RAM usage to DDR fill. Every visualization
+          works — your CPU cores glow as stars, your RAM drives the DDR channel
+          bars. Preview all the modes on the machine you already have, before your
+          Tenstorrent cloud instance, cards, or towers arrive.
+        </p>
+        <p class="mode-desc">
+          One quirk: in host mode the visualizer runs on the very CPU it's
+          watching, so rendering at high FPS heats and loads that CPU — and you
+          see it <em>in</em> the visualization. You're partly watching tt-toplike
+          watch itself. On a real TT card the tool watches a separate chip and
+          never steals compute from your workload. And each hardware type —
+          Grayskull, Wormhole, Blackhole, a multi-card tower — shows something
+          host mode can't: the point is to learn the visual language now.
         </p>
         <div class="mode-hints">
           <span class="mode-hint"><kbd>--host</kbd> flag</span>
           <span class="mode-hint"><kbd>--host --mode arcade</kbd></span>
         </div>
       </div>
-      <img src="assets/gifs/07-host-cpu.gif" alt="Host/CPU mode demo" class="mode-gif" loading="lazy">
+      <video class="mode-gif" src="assets/gifs/07-host-cpu.webm" autoplay muted loop playsinline
+             aria-label="Host/CPU mode demo"></video>
     </div>
 
   </div>
@@ -1099,18 +1327,22 @@
 
   <div class="gallery-grid">
     <div class="gallery-item wide">
-      <video autoplay muted loop playsinline
-             aria-label="tt-toplike Insights screen — four Blackhole chips at 58–77W under live LLM inference, showing chip portraits with real-time power and temperature">
-        <source src="assets/tt-toplike-insights.webm" type="video/webm">
-        <img src="assets/tt-toplike-with-info-with-activity.png" alt="tt-toplike Insights screen with four Blackhole chips under inference load">
-      </video>
-      <span class="gallery-caption">Insights mode — 4× Blackhole at 58–77W, live LLM inference</span>
+      <img src="assets/tt-toplike-insights.png"
+           alt="tt-toplike Insights screen — four Blackhole chips at 59–79W under live Llama-3.3-70B inference, showing per-chip Tensix portraits with real-time power, temperature, DDR training, and the vLLM engine using all four devices"
+           loading="lazy">
+      <span class="gallery-caption">Insights mode — 4× Blackhole under live Llama-3.3-70B inference (vLLM across all four chips)</span>
     </div>
     <div class="gallery-item">
       <img src="assets/tt-toplike-arcade-active.png"
            alt="tt-toplike arcade mode — four Blackhole chips at 58–66W under live inference load, showing Tensix starfield, memory castle particle hierarchy, and NoC flow"
            loading="lazy">
       <span class="gallery-caption">Arcade mode — 4× Blackhole at 58–66W, live LLM inference</span>
+    </div>
+    <div class="gallery-item">
+      <img src="assets/tt-toplike-hivemindsweeper.png"
+           alt="HivemindSweeper on 4× Blackhole — vLLM serving throughput surfaced from docker DEBUG logs, device-holder heartbeats across all four chips, and dozens of tt-metal kernel-compile artifacts, all coalesced into one source × device feed"
+           loading="lazy">
+      <span class="gallery-caption">HivemindSweeper — vLLM serving + kernel compiles surfaced live on 4× Blackhole</span>
     </div>
     <div class="gallery-item">
       <img src="assets/tt-toplike-rs.png"
@@ -1253,10 +1485,13 @@
       <div class="feature-icon">🛡</div>
       <p class="feature-title">Non-Invasive by Default</p>
       <p class="feature-desc">
-        The default backend chain is Sysfs → JSON (tt-smi subprocess) → Mock.
-        Direct PCI access via Luwen is only attempted when <code>--backend luwen</code>
-        is passed explicitly. You can monitor an LLM inference job without
-        any risk of disturbing the hardware state.
+        The default backend chain on Linux is Hybrid (sysfs + background tt-smi)
+        → JSON (tt-smi subprocess) → Mock. Everything on that path is an ordinary
+        read of a kernel file: the hwmon sensors plus tt-kmd's own
+        <code>/sys/class/tenstorrent/</code> attributes — clocks, ARC heartbeat,
+        firmware limits, PCIe counters. Direct PCI access via Luwen is only
+        attempted when <code>--backend luwen</code> is passed explicitly. You can
+        monitor an LLM inference job without any risk of disturbing the hardware state.
       </p>
     </div>
     <div class="feature-card">
@@ -1319,7 +1554,7 @@
   <p class="section-label">Get started</p>
   <h2 class="section-heading">Install</h2>
   <p class="section-sub">
-    Grab the Debian package for the fastest path. Or build from source with Cargo.
+    Add the Tenstorrent apt repository for the newest version — or grab a <code>.deb</code> from Releases, or build from source with Cargo.
   </p>
 
   <div class="install-block">
@@ -1327,15 +1562,15 @@
       <span class="install-num">1</span>
       <div class="install-body">
         <p>
-          Download the packages that match your Ubuntu version.
-          Two variants ship per release:
-          <code>_noble.deb</code> for Ubuntu 24.04+,
-          <code>_jammy.deb</code> for Ubuntu 22.04+.
+          Add the Tenstorrent apt repository (<code>ppa.tenstorrent.com</code>) —
+          the easiest way to get the latest version and stay current with
+          <code>apt upgrade</code>.
         </p>
         <div class="cmd-wrap">
-          <code class="cmd" id="cmd1">SUITE=$(. /etc/os-release && echo "$UBUNTU_CODENAME")
-[ "$SUITE" = "noble" ] || SUITE="jammy"
-gh release download --repo tenstorrent/tt-toplike --pattern "*_amd64_${SUITE}.deb"</code>
+          <code class="cmd" id="cmd1">sudo install -m 0755 -d /etc/apt/keyrings
+sudo wget -qO /etc/apt/keyrings/tt-pkg-key.asc https://ppa.tenstorrent.com/tt-pkg-key.asc
+echo "deb [signed-by=/etc/apt/keyrings/tt-pkg-key.asc] https://ppa.tenstorrent.com/ubuntu/ $(. /etc/os-release && echo $VERSION_CODENAME) main" | sudo tee /etc/apt/sources.list.d/tenstorrent.list
+sudo apt update</code>
           <button class="cmd-copy" data-target="cmd1">Copy</button>
         </div>
       </div>
@@ -1343,9 +1578,10 @@ gh release download --repo tenstorrent/tt-toplike --pattern "*_amd64_${SUITE}.de
     <div class="install-row">
       <span class="install-num">2</span>
       <div class="install-body">
-        <p>Install both packages:</p>
+        <p>Install the TUI — plus the optional native window host:</p>
         <div class="cmd-wrap">
-          <code class="cmd" id="cmd2">sudo dpkg -i tt-toplike_*_amd64_${SUITE}.deb tt-toplike-app_*_amd64_${SUITE}.deb</code>
+          <code class="cmd" id="cmd2">sudo apt install tt-toplike        # TUI monitor
+sudo apt install tt-toplike-app    # optional native window</code>
           <button class="cmd-copy" data-target="cmd2">Copy</button>
         </div>
       </div>

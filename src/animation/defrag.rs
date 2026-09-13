@@ -12,13 +12,14 @@
 //! | Signal           | Meaning in view                                  |
 //! |------------------|--------------------------------------------------|
 //! | aiclk            | Phase: 0 = DMA loading, high = executing         |
-//! | DDR_STATUS nibble| Per-channel init state (trained / untrained)     |
-//! | GDDR_x_y_TEMP    | Per-channel heat → color saturation & shimmer    |
+//! | DDR_STATUS nibble| Per-channel init state (trained / untrained) — used only when `gddr_telemetry` (tt-smi >= 6.3.0) is absent |
+//! | gddr_telemetry   | Real per-channel training/BIST/harvested/temp/directional ECC (tt-smi >= 6.3.0) — preferred over every packed signal below when present |
+//! | GDDR_x_y_TEMP    | Per-channel heat → color saturation & shimmer (packed-pair fallback) |
 //! | PCIe usage       | DMA bandwidth → write-head sweep speed           |
 //! | ETH_LIVE_STATUS  | Inter-chip links → link-pulse animation          |
-//! | ENABLED_GDDR     | Which channels exist on this chip                |
+//! | ENABLED_GDDR     | Which channels exist on this chip (packed-pair fallback) |
 //! | heartbeat        | ARC alive → periodic global pulse                |
-//! | corr_errs        | GDDR correctable errors → glitch flash           |
+//! | corr_errs        | GDDR correctable errors → glitch flash (packed-pair fallback; real per-channel corr/uncorr sums preferred) |
 //! | power (TDP)      | Overall load → brightness                        |
 //!
 //! ## Block states
@@ -30,6 +31,9 @@
 //! █  resident / written                   (full, colored by temp)
 //! ·  seek ahead of frontier               (faint dot)
 //! ✗  correctable error flash              (brief red, then heals)
+//! ✗  uncorrectable error flash            (brighter, longer-lived red — real per-channel data only)
+//! ✗  bad sector (BIST-fail)               (static dim red, whole row — permanent, real per-channel data only)
+//! ╌  disabled / harvested channel         (static dim gray, whole row)
 //! ```
 //!
 //! ## Phases
@@ -56,9 +60,73 @@ use ratatui::text::{Line, Span};
 
 const GDDR_CHANNELS: usize = 8;
 const POWER_IDLE_W: f32 = 8.0;
+/// Power must rise to this multiple of the captured idle baseline for a device to
+/// count as "saw a load" — the gate that arms power-based EVICT. Large margin:
+/// Blackhole idles at ~12–18 W and runs inference at ~60–77 W (≳4×), so this
+/// clears easily under load and never trips on a merely-idle chip (which on BH
+/// still sits in the Running phase because aiclk is always ≥200).
+const LOAD_SURGE_FACTOR: f32 = 1.5;
+
+/// Fraction of the board's own firmware-reported TDP limit above which a device
+/// counts as working even with no observed rest to compare against. On a p300c
+/// (125 W) this is ~37 W, against a measured 13–16 W idle — comfortably clear of
+/// rest, and far below the ~60–77 W of real inference.
+const RUN_TDP_FRACTION: f32 = 0.30;
+
+/// Whether a device's power says it is doing work, rather than merely powered on.
+///
+/// The gate this joins used to be `aiclk >= 200 && power > POWER_IDLE_W`, which
+/// silently assumed an architecture whose idle clock is ~0. Blackhole idles at
+/// ~800 MHz and 13–16 W, so both halves were permanently true and every chip on
+/// a fully idle box reported `RUN` — reported in review, reproducible on `main`.
+/// The surrounding code already knew this (see `LOAD_SURGE_FACTOR` and
+/// `running_since`, both of which exist to stop the resulting phantom-Running
+/// state from cascading into an EVICT loop); those were treatments of the
+/// symptom, and this is the cause.
+///
+/// Two independent pieces of evidence, because neither covers the other's case:
+///
+///  * **Against the chip's own observed rest** — the codebase's standing answer
+///    to absolute thresholds (`AdaptiveBaseline`, Phase 5): a 10% rise means the
+///    same thing on a 15 W board and a 300 W one. Needs rest to have been seen.
+///  * **Against the board's firmware-reported TDP limit** — for a monitor
+///    started *during* a workload, where there is no observed rest and the
+///    learned baseline would be the loaded power itself. This is a real number
+///    off the hardware (`limits.tdp_limit`), not a per-arch constant to drift.
+///
+/// `idle_power == 0.0` means "no rest observed yet", never "rest is 0 W".
+fn shows_load(power_ema: f32, idle_power: f32, tdp_limit: Option<f32>) -> bool {
+    if idle_power > 0.0 && power_ema > idle_power * LOAD_SURGE_FACTOR {
+        return true;
+    }
+    tdp_limit.is_some_and(|tdp| tdp > 0.0 && power_ema > tdp * RUN_TDP_FRACTION)
+}
 
 // EVICT is triggered by real hardware events, not a frame timer.
 // See Phase transition logic in update().
+
+/// Power-based EVICT eligibility (pure, unit-tested).
+///
+/// Fires only when a device has (a) been Running long enough to dodge the
+/// idle-BH Idle→Running→EVICT loop, (b) actually seen a load surge this run
+/// (`saw_load` — armed when power exceeded `idle_power × LOAD_SURGE_FACTOR`), and
+/// (c) fallen back to near its captured idle baseline. Without the `saw_load`
+/// gate a BH chip that merely sits idle (power_ema ≈ idle_power) would satisfy the
+/// threshold every frame and evict in a loop — which is why naively initializing
+/// `idle_power` is not enough on its own.
+fn evict_eligible(
+    frame: u64,
+    running_since: Option<u64>,
+    power_ema: f32,
+    idle_power: f32,
+    saw_load: bool,
+) -> bool {
+    let evict_threshold = (idle_power * 1.20).max(POWER_IDLE_W);
+    let ran_long_enough = running_since
+        .map(|f| frame.saturating_sub(f) >= 120)
+        .unwrap_or(false);
+    ran_long_enough && saw_load && power_ema <= evict_threshold
+}
 
 /// Which phase this device is in.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -80,19 +148,34 @@ enum Phase {
 #[derive(Debug, Clone)]
 struct Channel {
     /// DDR training status nibble for this channel-pair (0=untrained, 5=trained).
+    /// With real per-channel data (tt-smi >= 6.3.0) this is exact per channel
+    /// instead of shared across a pair.
     trained: bool,
     /// Fill fraction [0, 1] — how much of the channel's GDDR capacity is loaded.
     fill: f32,
     /// Smoothed temperature (EMA).
     temp_ema: f32,
-    /// Correctable error count (last seen).
-    last_corr_errs: u32,
-    /// Frames remaining to show an error flash.
+    /// Correctable error count (last seen) — real per-channel `corr_rd+corr_wr`
+    /// when available, else the packed pair counter widened to u64.
+    last_corr_errs: u64,
+    /// Frames remaining to show a correctable-error flash.
     err_flash: u8,
     /// Whether this channel is physically enabled on this chip.
     enabled: bool,
     /// Write-head position (0..=1) during DMA — trails behind `fill`.
     head_pos: f32,
+    /// Permanent (non-transient) bad-sector state: this channel failed BIST.
+    /// Real per-channel data only (tt-smi >= 6.3.0) — always `false` without
+    /// it, since the packed registers carry no BIST-pass signal at all.
+    bist_fail: bool,
+    /// Uncorrectable error count (last seen). Real per-channel data only —
+    /// the packed registers have no directional/uncorrectable breakdown, so
+    /// this stays at 0 (never flashes) without `gddr_telemetry`.
+    last_uncorr_errs: u64,
+    /// Frames remaining to show an uncorrectable-error flash — harsher and
+    /// longer than `err_flash`, since uncorrectable errors are the more
+    /// severe signal (data corruption risk, not just a corrected bit).
+    uncorr_flash: u8,
 }
 
 impl Channel {
@@ -105,6 +188,9 @@ impl Channel {
             err_flash: 0,
             enabled: true,
             head_pos: 0.0,
+            bist_fail: false,
+            last_uncorr_errs: 0,
+            uncorr_flash: 0,
         }
     }
 }
@@ -156,6 +242,10 @@ struct DeviceState {
     /// EVICT only fires after a minimum dwell in Running so idle BH chips
     /// (aiclk always ≥200, power never spikes) don't loop Idle→Running→EVICT.
     running_since: Option<u64>,
+    /// Whether power has surged above `idle_power × LOAD_SURGE_FACTOR` during the
+    /// current Running spell. Arms power-based EVICT: without it, an idle BH chip
+    /// (which sits in Running because aiclk ≥200) would evict every frame.
+    saw_load: bool,
 }
 
 impl DeviceState {
@@ -176,6 +266,7 @@ impl DeviceState {
             scatter_bursts: Vec::new(),
             burst_cooldown: 0,
             running_since: None,
+            saw_load: false,
         }
     }
 
@@ -242,10 +333,24 @@ impl DefragVis {
                 .unwrap_or(0);
             let sysfs_aiclk = telem.and_then(|t| t.aiclk).unwrap_or(0);
             let aiclk = smbus_aiclk.max(sysfs_aiclk);
+            // The board's own reported power ceiling, used by `shows_load` as
+            // the fallback when no rest has been observed. `None` on backends
+            // that don't report limits, which just leaves the learned baseline.
+            let tdp_limit = device.limits.as_ref().and_then(|l| l.tdp_limit);
             let hb = telem.and_then(|t| t.heartbeat).unwrap_or(0);
 
             // Fast EMA (noise filter for phase transitions).
-            ds.power_ema = ds.power_ema * 0.92 + power * 0.08;
+            //
+            // Seeded from the first real sample rather than climbing out of
+            // zero: an EMA starting at 0 spends ~40 frames below the truth, and
+            // the idle baseline learned underneath it (below) would latch onto
+            // a value from that ramp — a "rest" reading of ~1 W that no board
+            // has, which then makes every later reading look like a load.
+            if ds.power_ema == 0.0 {
+                ds.power_ema = power;
+            } else {
+                ds.power_ema = ds.power_ema * 0.92 + power * 0.08;
+            }
             // Slow EMA (long-term baseline; surge = fast >> slow).
             ds.power_ema_slow = ds.power_ema_slow * 0.992 + power * 0.008;
 
@@ -258,7 +363,18 @@ impl DefragVis {
                 ds.heartbeat_pulse -= 1;
             }
 
-            // Per-channel temps from SMBUS
+            // Real per-channel GDDR telemetry (tt-smi >= 6.3.0), when this
+            // device reports it. Falls back to the packed pair-resolution
+            // registers below when absent or empty — no version-string
+            // gating anywhere, purely data-presence-driven, matching every
+            // other consumer of this field.
+            let gddr = smbus
+                .and_then(|s| s.gddr_telemetry.as_ref())
+                .filter(|g| !g.channels.is_empty());
+
+            // Per-channel temps from SMBUS (packed-pair fallback only — real
+            // per-channel temp_top/temp_bottom is read directly from `gddr`
+            // per channel below).
             let ch_temps: [f32; GDDR_CHANNELS] = if let Some(s) = smbus {
                 [
                     s.gddr_temps[0].map(|p| p.0[0]).unwrap_or(25.0),
@@ -274,12 +390,14 @@ impl DefragVis {
                 [25.0; GDDR_CHANNELS]
             };
 
-            // Per-channel DDR training status (nibble per channel-pair from DDR_STATUS)
+            // Per-channel DDR training status (nibble per channel-pair from
+            // DDR_STATUS) — packed-pair fallback only; real per-channel
+            // `training_pass` is read from `gddr` per channel below.
             let ddr_mask: u64 = smbus
                 .and_then(|s| s.ddr_status_bitmask())
                 .unwrap_or(0xffff_ffff_ffff_ffff); // assume trained if no smbus
 
-            // ENABLED_GDDR bitmask — one bit per channel
+            // ENABLED_GDDR bitmask — one bit per channel (packed-pair fallback only).
             let enabled_mask: u8 = smbus
                 .and_then(|s| s.enabled_gddr)
                 .map(|v| v as u8)
@@ -297,7 +415,9 @@ impl DefragVis {
                 .map(|v| v.count_ones())
                 .unwrap_or(0);
 
-            // Per-channel correctable errors (one counter per pair)
+            // Per-channel correctable errors (one counter per pair) —
+            // packed-pair fallback only; real per-channel `corr_rd`/`corr_wr`/
+            // `uncorr_rd`/`uncorr_wr` are read from `gddr` per channel below.
             let corr: [u32; 4] = if let Some(s) = smbus {
                 [
                     s.gddr_corr_errs[0].unwrap_or(0),
@@ -311,23 +431,85 @@ impl DefragVis {
 
             // Update per-channel static properties
             for (ch_idx, ch) in ds.channels.iter_mut().enumerate() {
-                ch.enabled = (enabled_mask >> ch_idx) & 1 == 1;
-                ch.temp_ema = ch.temp_ema * 0.92 + ch_temps[ch_idx] * 0.08;
+                // Real per-channel data takes priority when this device
+                // reports it. A channel id absent from the real set (e.g. a
+                // dropped malformed entry, or an architectural channel tt-smi
+                // doesn't address) is treated as inert/absent rather than
+                // falling back to the packed-pair registers for just that
+                // channel — mixing a real-data device's channels between two
+                // unrelated sources would misrepresent both.
+                let real_channel =
+                    gddr.and_then(|g| g.channels.iter().find(|c| c.channel == ch_idx));
 
-                // DDR_STATUS: 4 bits per channel-pair; nibble 0 = channels 0-1, etc.
-                // Bit pattern 0x5 = trained for a pair.
-                let nibble_idx = ch_idx / 2;
-                let nibble = ((ddr_mask >> (nibble_idx * 4)) & 0xf) as u8;
-                ch.trained = nibble >= 4; // 4=init, 5=trained
+                match real_channel {
+                    Some(rc) => {
+                        ch.enabled = rc.enabled;
+                        ch.trained = rc.training_pass;
+                        // A harvested channel has nothing to BIST — don't mark
+                        // it as a fault on top of already being absent.
+                        ch.bist_fail = !rc.harvested && !rc.bist_pass;
 
-                // Error flash detection
-                let pair_errs = corr[ch_idx / 2];
-                if pair_errs > ch.last_corr_errs {
-                    ch.err_flash = 12; // flash for ~12 frames
+                        let real_temp = match (rc.temp_top, rc.temp_bottom) {
+                            (Some(t), Some(b)) => (t + b) / 2.0,
+                            (Some(t), None) | (None, Some(t)) => t,
+                            (None, None) => ch.temp_ema, // no reading this tick — hold steady
+                        };
+                        ch.temp_ema = ch.temp_ema * 0.92 + real_temp * 0.08;
+
+                        // A missing/malformed counter (None) contributes 0 to
+                        // the sum here -- distinguishing "not reported" from
+                        // "genuinely zero" only matters where a whole-row
+                        // fallback decision is made (json.rs's GddrChannel
+                        // doc comment), not for this per-tick delta.
+                        let corr_sum = rc
+                            .corr_rd
+                            .unwrap_or(0)
+                            .saturating_add(rc.corr_wr.unwrap_or(0));
+                        if corr_sum > ch.last_corr_errs {
+                            ch.err_flash = 12; // flash for ~12 frames
+                        }
+                        ch.last_corr_errs = corr_sum;
+
+                        let uncorr_sum = rc
+                            .uncorr_rd
+                            .unwrap_or(0)
+                            .saturating_add(rc.uncorr_wr.unwrap_or(0));
+                        if uncorr_sum > ch.last_uncorr_errs {
+                            ch.uncorr_flash = 20; // longer than a correctable flash
+                        }
+                        ch.last_uncorr_errs = uncorr_sum;
+                    }
+                    None if gddr.is_some() => {
+                        ch.enabled = false;
+                        ch.trained = false;
+                        ch.bist_fail = false;
+                    }
+                    None => {
+                        // No real per-channel data for this device at all —
+                        // exact pre-feature behavior, byte-for-byte.
+                        ch.enabled = (enabled_mask >> ch_idx) & 1 == 1;
+                        ch.temp_ema = ch.temp_ema * 0.92 + ch_temps[ch_idx] * 0.08;
+
+                        // DDR_STATUS: 4 bits per channel-pair; nibble 0 = channels 0-1, etc.
+                        // Bit pattern 0x5 = trained for a pair.
+                        let nibble_idx = ch_idx / 2;
+                        let nibble = ((ddr_mask >> (nibble_idx * 4)) & 0xf) as u8;
+                        ch.trained = nibble >= 4; // 4=init, 5=trained
+                        ch.bist_fail = false;
+
+                        let pair_errs = corr[ch_idx / 2] as u64;
+                        if pair_errs > ch.last_corr_errs {
+                            ch.err_flash = 12; // flash for ~12 frames
+                        }
+                        ch.last_corr_errs = pair_errs;
+                    }
                 }
-                ch.last_corr_errs = pair_errs;
+
                 if ch.err_flash > 0 {
                     ch.err_flash -= 1;
+                }
+                if ch.uncorr_flash > 0 {
+                    ch.uncorr_flash -= 1;
                 }
             }
 
@@ -366,23 +548,21 @@ impl DefragVis {
                 }
             } else if !ds.channels.iter().any(|c| c.enabled && c.trained) {
                 Phase::Init
-            } else if ds.phase == Phase::Running && {
-                // EVICT: power returned to near the idle baseline captured at DMA-start.
-                // Threshold = idle_power + 20% headroom, clamped to at least POWER_IDLE_W.
-                //
-                // Guard: require ≥120 frames (~2 s at 60 fps) in Running before EVICT is
-                // eligible.  BH chips sit at aiclk ≥200 and idle power regardless of load,
-                // so without this guard they'd loop Idle → Running → EVICT on every frame.
-                let evict_threshold = (ds.idle_power * 1.20).max(POWER_IDLE_W);
-                let ran_long_enough = ds
-                    .running_since
-                    .map(|f| self.frame.saturating_sub(f) >= 120)
-                    .unwrap_or(false);
-                ran_long_enough && ds.power_ema <= evict_threshold
-            } {
+            } else if ds.phase == Phase::Running
+                && evict_eligible(
+                    self.frame,
+                    ds.running_since,
+                    ds.power_ema,
+                    ds.idle_power,
+                    ds.saw_load,
+                )
+            {
                 // Power dropped back to idle — model unloaded → EVICT.
                 Phase::Deconstructing
-            } else if (aiclk >= 200 || all_full) && power > POWER_IDLE_W {
+            } else if (aiclk >= 200 || all_full)
+                && power > POWER_IDLE_W
+                && shows_load(ds.power_ema, ds.idle_power, tdp_limit)
+            {
                 Phase::Running
             } else if aiclk < 200 && power > POWER_IDLE_W {
                 Phase::Dma
@@ -401,6 +581,35 @@ impl DefragVis {
                 }
                 (p, Phase::Running) if p != Phase::Running => {
                     ds.running_since = Some(self.frame);
+                    ds.saw_load = false;
+                    // Capture the pre-load idle baseline when a chip goes straight
+                    // Idle/Init → Running (Blackhole: aiclk is always ≥200, so it
+                    // never dwells in Idle). Arriving via Dma instead, idle_power
+                    // was already captured at Dma-start, so leave it.
+                    //
+                    // Use the smoothed `power_ema`, not the raw instantaneous
+                    // `power` sample, matching the other two capture sites
+                    // (Dma-entry, Idle-entry) below. A single noisy low
+                    // sample here previously set an artificially-low
+                    // baseline — since this transition fires on nearly every
+                    // tick on Blackhole (aiclk almost always ≥200), ordinary
+                    // idle jitter could then both arm `saw_load` (exceed
+                    // idle_power×1.5) and satisfy the evict condition (fall
+                    // back within idle_power×1.20), evicting a device that
+                    // never actually loaded anything.
+                    //
+                    // Only when no rest has ever been observed. This capture
+                    // exists because Blackhole "never dwells in Idle" — which
+                    // was true only while the phase gate called an idle chip
+                    // Running. Now that it does dwell, overwriting a learned
+                    // baseline with the *loaded* reading raises the bar by
+                    // 1.5x of a loaded value and immediately drops the device
+                    // back out of Running: measured on a 14W-rest chip pulling
+                    // 25W, which entered Running, rewrote its baseline to
+                    // 21.3W, and fell straight back to Idle.
+                    if matches!(p, Phase::Idle | Phase::Init) && ds.idle_power == 0.0 {
+                        ds.idle_power = ds.power_ema;
+                    }
                     for ch in ds.channels.iter_mut() {
                         if ch.enabled && ch.trained {
                             ch.fill = 1.0;
@@ -416,9 +625,23 @@ impl DefragVis {
                     ds.burst_cooldown = 0;
                     ds.inference_energy = 0.0;
                     ds.running_since = None;
+                    // Disarm the load gate — the next Running spell must see its own surge.
+                    ds.saw_load = false;
                 }
                 (_, Phase::Idle) => {
-                    ds.idle_power = ds.power_ema;
+                    // A running *minimum*, not a re-capture. This arm has no
+                    // guard, so it fires on every frame the device is idle —
+                    // assigning `power_ema` outright pinned the baseline to the
+                    // live reading, making `power_ema > idle_power × 1.5`
+                    // unsatisfiable (p > 1.5p) and leaving the learned half of
+                    // `shows_load` permanently dead. A minimum converges on the
+                    // chip's true rest and then holds still, which is what a
+                    // baseline is for.
+                    ds.idle_power = if ds.idle_power > 0.0 {
+                        ds.idle_power.min(ds.power_ema)
+                    } else {
+                        ds.power_ema
+                    };
                     // Drop any in-flight bursts — they belong to the Running phase and
                     // should not bleed into Idle's static rendering.
                     ds.scatter_bursts.clear();
@@ -473,6 +696,13 @@ impl DefragVis {
                 }
 
                 Phase::Running => {
+                    // Arm the power-based EVICT gate: once power rises well above the
+                    // captured idle baseline, this run has genuinely loaded something,
+                    // so a later drop back to idle is a real unload (not idle jitter).
+                    if ds.idle_power > 0.0 && ds.power_ema > ds.idle_power * LOAD_SURGE_FACTOR {
+                        ds.saw_load = true;
+                    }
+
                     // Continuous organic signals — update every frame.
 
                     // thermal_mood: slow EMA of mean GDDR temp, normalized 25°C→0, 85°C→1.
@@ -576,6 +806,40 @@ impl DefragVis {
                     }
                 }
             }
+        }
+    }
+
+    /// Force every loaded device into the EVICT (Deconstructing) animation.
+    ///
+    /// Driven by an explicit model-unload signal from the inference monitor — a
+    /// reliable discrete event. The power-EMA heuristic in `update()` can't be
+    /// relied on for this: on Blackhole `aiclk` is always ≥200, so the chip jumps
+    /// straight from the initial Idle to Running and never returns to Idle, leaving
+    /// `idle_power` at its 0.0 init value; that pins the evict threshold to
+    /// `POWER_IDLE_W` (8 W), which real BH idle power (>8 W) never falls to — so
+    /// EVICT is otherwise unreachable there.
+    ///
+    /// Fills each device's trained channels then hands them to `Deconstructing`, so
+    /// there's a full→empty drain to watch (mirrors the Running→Deconstructing
+    /// side-effects in `update()`). Devices with no trained channels are skipped.
+    /// `update()` respects the forced phase — it holds `Deconstructing` until the
+    /// channels drain, then returns to `Idle`.
+    pub fn trigger_evict(&mut self) {
+        for ds in self.devices.values_mut() {
+            if !ds.channels.iter().any(|c| c.enabled && c.trained) {
+                continue;
+            }
+            for ch in ds.channels.iter_mut() {
+                if ch.enabled && ch.trained {
+                    ch.fill = 1.0;
+                    ch.head_pos = 1.0;
+                }
+            }
+            ds.phase = Phase::Deconstructing;
+            ds.running_since = None;
+            ds.scatter_bursts.clear();
+            ds.burst_cooldown = 0;
+            ds.inference_energy = 0.0;
         }
     }
 
@@ -815,13 +1079,29 @@ impl DefragVis {
         let fill = ch.map(|c| c.fill).unwrap_or(0.0);
         let ch_temp = ch.map(|c| c.temp_ema).unwrap_or(asic_temp);
         let err_flash = ch.map(|c| c.err_flash).unwrap_or(0);
+        let uncorr_flash = ch.map(|c| c.uncorr_flash).unwrap_or(0);
+        let bist_fail = ch.map(|c| c.bist_fail).unwrap_or(false);
 
         if !enabled {
-            // Disabled channel: hatched
+            // Disabled/harvested channel: hatched
             let s: String = (0..grid_w).map(|_| '╌').collect();
             spans.push(Span::styled(
                 s,
                 Style::default().fg(colors::rgb(30, 30, 40)),
+            ));
+            return;
+        }
+
+        if bist_fail {
+            // Bad sector: this channel exists but failed BIST — a permanent
+            // fault (real per-channel data only), not a transient error.
+            // Static (no animation, no fill/drain/frontier) so it reads as
+            // distinct from both the harvested hatch above and the brief
+            // bright flash used for a live correctable/uncorrectable error.
+            let s: String = (0..grid_w).map(|_| '✗').collect();
+            spans.push(Span::styled(
+                s,
+                Style::default().fg(colors::rgb(120, 25, 25)),
             ));
             return;
         }
@@ -933,6 +1213,14 @@ impl DefragVis {
         };
 
         // --- Error flash cell (if active) ---
+        // Uncorrectable takes precedence when both are active — it's the
+        // more severe signal (real per-channel data only; without it,
+        // uncorr_flash is always 0 and this branch never lights up).
+        let uncorr_flash_col = if uncorr_flash > 0 {
+            Some(resident_cells.saturating_sub(1))
+        } else {
+            None
+        };
         let flash_col = if err_flash > 0 {
             Some(resident_cells.saturating_sub(1))
         } else {
@@ -969,8 +1257,15 @@ impl DefragVis {
 
         // --- Resident region (col 0..resident_cells) ---
         for col in 0..resident_cells.min(cells) {
-            let (glyph, style) = if flash_col == Some(col) {
-                // Error flash: dark red ✗ — not white, uses block glyph intensity
+            let (glyph, style) = if uncorr_flash_col == Some(col) {
+                // Uncorrectable error flash: brighter and longer-lived than a
+                // correctable flash (no 0.55 cap) — data corruption risk,
+                // not just a corrected bit.
+                let intensity = (uncorr_flash as f32 / 20.0).max(0.35);
+                let ec = hsv_to_rgb(0.0, 1.0, intensity);
+                ('✗', Style::default().fg(ec).add_modifier(Modifier::BOLD))
+            } else if flash_col == Some(col) {
+                // Correctable error flash: dark red ✗ — not white, uses block glyph intensity
                 let intensity = err_flash as f32 / 12.0 * 0.55; // cap at 0.55
                 let ec = hsv_to_rgb(0.0, 1.0, intensity);
                 ('✗', Style::default().fg(ec).add_modifier(Modifier::BOLD))
@@ -1503,5 +1798,575 @@ mod tests {
         assert_eq!(ds.burst_cooldown, 0);
         // inference_energy not zeroed in Idle arm — that's intentional (power EMA
         // stays meaningful; energy decay handles it naturally).
+    }
+
+    #[test]
+    fn trigger_evict_forces_deconstructing_on_trained_devices() {
+        let mut dv = DefragVis::new(120, 40);
+        let mut ds = DeviceState::new(0);
+        ds.phase = Phase::Running;
+        ds.running_since = Some(5);
+        ds.channels[0].enabled = true;
+        ds.channels[0].trained = true;
+        ds.channels[0].fill = 1.0;
+        dv.devices.insert(0, ds);
+
+        // A second device with no trained channels must be left alone.
+        let mut idle = DeviceState::new(1);
+        idle.phase = Phase::Idle;
+        dv.devices.insert(1, idle);
+
+        dv.trigger_evict();
+
+        let evicting = &dv.devices[&0];
+        assert_eq!(
+            evicting.phase,
+            Phase::Deconstructing,
+            "a loaded device must enter EVICT on the unload signal"
+        );
+        assert!(
+            evicting.channels[0].fill > 0.0,
+            "channel is full, about to drain"
+        );
+        assert_eq!(
+            evicting.running_since, None,
+            "running dwell reset for EVICT"
+        );
+
+        assert_eq!(
+            dv.devices[&1].phase,
+            Phase::Idle,
+            "a device with no trained channels is not evicted"
+        );
+    }
+
+    #[test]
+    fn evict_eligible_gates_on_saw_load_to_prevent_idle_loop() {
+        // Idle Blackhole: power_ema ≈ idle_power, been "Running" a long time, but
+        // never saw a load surge → must NOT be eligible (this is the loop guard).
+        assert!(!evict_eligible(200, Some(0), 15.0, 15.0, false));
+        // Loaded then dropped back to idle, with a surge seen → eligible (EVICT).
+        assert!(evict_eligible(200, Some(0), 15.0, 15.0, true));
+        // Still loaded (power high) → not eligible.
+        assert!(!evict_eligible(200, Some(0), 60.0, 15.0, true));
+        // Hasn't been Running long enough → not eligible.
+        assert!(!evict_eligible(50, Some(0), 15.0, 15.0, true));
+        // Never entered Running → not eligible.
+        assert!(!evict_eligible(200, None, 15.0, 15.0, true));
+    }
+
+    // ── Real per-channel gddr_telemetry (tt-smi >= 6.3.0) ──────────────────
+
+    use crate::models::telemetry::{GddrChannel, GddrTelemetry};
+    use crate::models::{Device, SmbusTelemetry, Telemetry};
+
+    /// A minimal backend fixture with full control over one device's
+    /// telemetry/SMBUS state — used to exercise `update()`'s real-vs-packed
+    /// data sourcing precisely, which none of this file's other tests
+    /// (which manipulate `Channel`/`DeviceState` fields directly) touch.
+    struct FakeBackend {
+        devices: Vec<Device>,
+        telemetry: Vec<Telemetry>,
+        smbus: Vec<SmbusTelemetry>,
+    }
+
+    impl FakeBackend {
+        fn one_device(power: f32, smbus: SmbusTelemetry) -> Self {
+            let device = Device::new(
+                0,
+                "p300c".to_string(),
+                "0000:01:00.0".to_string(),
+                String::new(),
+            );
+            let telemetry = Telemetry {
+                voltage: Some(0.72),
+                current: Some(20.0),
+                power: Some(power),
+                asic_temperature: Some(40.0),
+                aiclk: Some(200),
+                heartbeat: Some(1),
+                timestamp: chrono::Utc::now(),
+                board_power: None,
+            };
+            Self {
+                devices: vec![device],
+                telemetry: vec![telemetry],
+                smbus: vec![smbus],
+            }
+        }
+    }
+
+    impl TelemetryBackend for FakeBackend {
+        fn init(&mut self) -> crate::error::BackendResult<()> {
+            Ok(())
+        }
+        fn update(&mut self) -> crate::error::BackendResult<()> {
+            Ok(())
+        }
+        fn devices(&self) -> &[Device] {
+            &self.devices
+        }
+        fn telemetry(&self, device_idx: usize) -> Option<&Telemetry> {
+            self.telemetry.get(device_idx)
+        }
+        fn smbus_telemetry(&self, device_idx: usize) -> Option<&SmbusTelemetry> {
+            self.smbus.get(device_idx)
+        }
+        fn backend_info(&self) -> String {
+            "fake".to_string()
+        }
+    }
+
+    fn healthy_channel(channel: usize) -> GddrChannel {
+        GddrChannel {
+            channel,
+            harvested: false,
+            enabled: true,
+            training_pass: true,
+            bist_pass: true,
+            temp_top: Some(40.0),
+            temp_bottom: Some(42.0),
+            corr_rd: Some(0),
+            corr_wr: Some(0),
+            uncorr_rd: Some(0),
+            uncorr_wr: Some(0),
+        }
+    }
+
+    #[test]
+    fn real_per_channel_data_overrides_packed_pair_decode_at_true_resolution() {
+        // Packed DDR_STATUS would decode BOTH channels 0 and 1 (same nibble,
+        // pair index 0) as untrained: nibble 0x0. If real data weren't
+        // consulted, both would show `trained = false`. Real gddr_telemetry
+        // says channel 0 is trained and channel 1 is harvested — a
+        // distinction the packed pair-nibble simply cannot express.
+        let mut smbus = SmbusTelemetry::new();
+        smbus.gddr_telemetry = Some(GddrTelemetry {
+            speed: Some("16G".to_string()),
+            max_temp: Some(42.0),
+            enabled_mask: Some(0xff),
+            channels: vec![
+                healthy_channel(0),
+                GddrChannel {
+                    harvested: true,
+                    enabled: false,
+                    training_pass: false,
+                    bist_pass: false,
+                    ..healthy_channel(1)
+                },
+            ],
+        });
+        // ddr_status_bitmask() decodes to 0x0 for the pair (untrained) — the
+        // opposite of what real data says for channel 0.
+        smbus.ddr_status = Some("0x0".to_string());
+
+        let backend = FakeBackend::one_device(20.0, smbus);
+        let mut dv = DefragVis::new(120, 40);
+        dv.update(&backend);
+
+        let ds = &dv.devices[&0];
+        assert!(
+            ds.channels[0].trained,
+            "channel 0's real training_pass=true must win over the packed pair decode"
+        );
+        assert!(
+            !ds.channels[1].enabled,
+            "channel 1's real harvested=true must win over the packed pair decode"
+        );
+    }
+
+    /// Blackhole idles at ~800 MHz and 13-16 W, so the old gate
+    /// (`aiclk >= 200 && power > 8 W`) was permanently true and all four chips
+    /// on a fully idle box read `RUN` — reported in review, and reproducible on
+    /// `main`. The numbers below are this box's real idle telemetry
+    /// (`tt-smi -s`: 13-16 W at 800 MHz, TDP limit 125 W).
+    ///
+    /// The gate now asks the question the phase actually means — is this chip
+    /// doing more than it does at rest — rather than comparing against an
+    /// absolute floor calibrated for an architecture whose idle clock is 0.
+    #[test]
+    fn an_idle_blackhole_does_not_read_as_running() {
+        let idle = |power: f32| {
+            let mut smbus = SmbusTelemetry::new();
+            smbus.gddr_telemetry = Some(GddrTelemetry {
+                speed: Some("16G".to_string()),
+                max_temp: Some(42.0),
+                enabled_mask: Some(0xff),
+                channels: vec![healthy_channel(0), healthy_channel(1)],
+            });
+            let mut b = FakeBackend::one_device(power, smbus);
+            b.telemetry[0].aiclk = Some(800); // BH idles here — never 0
+            b.devices[0].limits = Some(crate::models::telemetry::DeviceLimits {
+                tdp_limit: Some(125.0),
+                ..Default::default()
+            });
+            b
+        };
+
+        let mut dv = DefragVis::new(80, 24);
+        let backend = idle(14.0);
+        for _ in 0..200 {
+            dv.update(&backend);
+        }
+        assert_ne!(
+            dv.devices[&0].phase,
+            Phase::Running,
+            "13-16 W at 800 MHz is this board at rest, not executing a model"
+        );
+
+        // The discriminating half: a chip actually under load must still read
+        // RUN, or the fix has simply traded one wrong answer for another.
+        let mut dv = DefragVis::new(80, 24);
+        let loaded = idle(95.0);
+        for _ in 0..200 {
+            dv.update(&loaded);
+        }
+        assert_eq!(
+            dv.devices[&0].phase,
+            Phase::Running,
+            "95 W of a 125 W board is unambiguously executing"
+        );
+    }
+
+    /// The learned-baseline half of `shows_load`, on its own: a load that is
+    /// real for this chip but well *below* the TDP backstop, so only the
+    /// comparison against observed rest can catch it. Without this, both other
+    /// phase tests pass on the backstop alone and the baseline path is dead
+    /// code — which is exactly what happened when the idle arm re-captured
+    /// `idle_power = power_ema` every frame, pinning the threshold to the live
+    /// reading and making `p > 1.5p` unsatisfiable.
+    #[test]
+    fn a_modest_load_below_the_tdp_backstop_still_reads_as_running() {
+        let at = |power: f32| {
+            let mut smbus = SmbusTelemetry::new();
+            smbus.gddr_telemetry = Some(GddrTelemetry {
+                speed: Some("16G".to_string()),
+                max_temp: Some(42.0),
+                enabled_mask: Some(0xff),
+                channels: vec![healthy_channel(0), healthy_channel(1)],
+            });
+            let mut b = FakeBackend::one_device(power, smbus);
+            b.telemetry[0].aiclk = Some(800);
+            b.devices[0].limits = Some(crate::models::telemetry::DeviceLimits {
+                tdp_limit: Some(125.0),
+                ..Default::default()
+            });
+            b
+        };
+
+        let mut dv = DefragVis::new(80, 24);
+        // Settle at rest so the baseline is learned.
+        let resting = at(14.0);
+        for _ in 0..200 {
+            dv.update(&resting);
+        }
+        assert_eq!(dv.devices[&0].phase, Phase::Idle, "precondition: at rest");
+        assert!(
+            dv.devices[&0].idle_power > 12.0 && dv.devices[&0].idle_power < 16.0,
+            "baseline must settle on the observed rest, got {}",
+            dv.devices[&0].idle_power
+        );
+
+        // 25 W: comfortably above 14 x 1.5, and comfortably below 125 x 0.30.
+        let working = at(25.0);
+        for _ in 0..100 {
+            dv.update(&working);
+        }
+        assert_eq!(
+            dv.devices[&0].phase,
+            Phase::Running,
+            "25W against a learned 14W rest is real work, even though it never \
+             reaches the 37.5W TDP backstop"
+        );
+    }
+
+    /// Started *during* a workload there is no observed rest to compare
+    /// against, so the learned baseline is useless and the board's own
+    /// firmware-reported TDP limit is what separates work from rest.
+    #[test]
+    fn a_monitor_started_mid_workload_still_reports_running() {
+        let mut smbus = SmbusTelemetry::new();
+        smbus.gddr_telemetry = Some(GddrTelemetry {
+            speed: Some("16G".to_string()),
+            max_temp: Some(70.0),
+            enabled_mask: Some(0xff),
+            channels: vec![healthy_channel(0), healthy_channel(1)],
+        });
+        let mut backend = FakeBackend::one_device(100.0, smbus);
+        backend.telemetry[0].aiclk = Some(1000);
+        backend.devices[0].limits = Some(crate::models::telemetry::DeviceLimits {
+            tdp_limit: Some(125.0),
+            ..Default::default()
+        });
+
+        let mut dv = DefragVis::new(80, 24);
+        for _ in 0..200 {
+            dv.update(&backend);
+        }
+        assert_eq!(
+            dv.devices[&0].phase,
+            Phase::Running,
+            "first sample already loaded — the TDP-relative backstop must carry it"
+        );
+    }
+
+    #[test]
+    fn real_per_channel_temp_overrides_packed_pair_temp() {
+        use crate::models::telemetry::GddrTempPair;
+
+        let mut smbus = SmbusTelemetry::new();
+        // Packed pair temp for channel 0 (pair 0, slot 0) says 25°C.
+        smbus.gddr_temps[0] = Some(GddrTempPair([25.0, 25.0, 25.0, 25.0]));
+        smbus.gddr_telemetry = Some(GddrTelemetry {
+            speed: Some("16G".to_string()),
+            max_temp: Some(80.0),
+            enabled_mask: Some(0xff),
+            channels: vec![GddrChannel {
+                temp_top: Some(80.0),
+                temp_bottom: Some(80.0),
+                ..healthy_channel(0)
+            }],
+        });
+
+        let backend = FakeBackend::one_device(20.0, smbus);
+        let mut dv = DefragVis::new(120, 40);
+        for _ in 0..50 {
+            dv.update(&backend);
+        }
+
+        let ds = &dv.devices[&0];
+        assert!(
+            ds.channels[0].temp_ema > 60.0,
+            "temp_ema={} should have converged toward the real 80°C reading, \
+             not the packed pair's 25°C",
+            ds.channels[0].temp_ema
+        );
+    }
+
+    #[test]
+    fn bist_fail_channel_renders_a_static_bad_sector_distinct_from_harvested_and_flash() {
+        let mut smbus = SmbusTelemetry::new();
+        smbus.gddr_telemetry = Some(GddrTelemetry {
+            speed: Some("16G".to_string()),
+            max_temp: Some(40.0),
+            enabled_mask: Some(0xff),
+            channels: vec![GddrChannel {
+                bist_pass: false,
+                ..healthy_channel(0)
+            }],
+        });
+
+        let backend = FakeBackend::one_device(20.0, smbus);
+        let mut dv = DefragVis::new(120, 40);
+        dv.update(&backend);
+
+        assert!(
+            dv.devices[&0].channels[0].bist_fail,
+            "bist_pass=false, harvested=false must set bist_fail"
+        );
+
+        let lines = dv.render(&backend);
+        let bad_sector_style = Style::default().fg(colors::rgb(120, 25, 25));
+        let has_bad_sector_row = lines.iter().any(|l| {
+            l.spans
+                .iter()
+                .any(|s| s.content.contains('✗') && s.style == bad_sector_style)
+        });
+        assert!(
+            has_bad_sector_row,
+            "expected a static bad-sector '✗' span styled distinctly from the harvested hatch and the bright error flash"
+        );
+    }
+
+    #[test]
+    fn harvested_channel_does_not_also_render_as_bist_fail() {
+        // A harvested channel has nothing to BIST — it must take the
+        // existing "disabled" hatch, never the new bad-sector state, even
+        // if its bist_pass happens to read false.
+        let mut smbus = SmbusTelemetry::new();
+        smbus.gddr_telemetry = Some(GddrTelemetry {
+            speed: Some("16G".to_string()),
+            max_temp: Some(40.0),
+            enabled_mask: Some(0xff),
+            channels: vec![GddrChannel {
+                harvested: true,
+                enabled: false,
+                bist_pass: false,
+                ..healthy_channel(0)
+            }],
+        });
+
+        let backend = FakeBackend::one_device(20.0, smbus);
+        let mut dv = DefragVis::new(120, 40);
+        dv.update(&backend);
+
+        assert!(
+            !dv.devices[&0].channels[0].bist_fail,
+            "a harvested channel must never be flagged bist_fail"
+        );
+    }
+
+    #[test]
+    fn uncorrectable_error_flash_is_brighter_and_longer_than_correctable() {
+        let mut smbus = SmbusTelemetry::new();
+        smbus.gddr_telemetry = Some(GddrTelemetry {
+            speed: Some("16G".to_string()),
+            max_temp: Some(40.0),
+            enabled_mask: Some(0xff),
+            channels: vec![healthy_channel(0)],
+        });
+        let backend = FakeBackend::one_device(20.0, smbus.clone());
+        let mut dv = DefragVis::new(120, 40);
+        dv.update(&backend); // establish baseline (0 errors seen)
+
+        // Bump only the uncorrectable counter — correctable stays at 0.
+        let mut smbus2 = smbus;
+        smbus2.gddr_telemetry.as_mut().unwrap().channels[0].uncorr_rd = Some(3);
+        let backend2 = FakeBackend::one_device(20.0, smbus2);
+        dv.update(&backend2);
+
+        let ch = &dv.devices[&0].channels[0];
+        assert_eq!(
+            ch.uncorr_flash, 19,
+            "uncorr_flash set to 20, then one decrement this frame"
+        );
+        assert_eq!(
+            ch.err_flash, 0,
+            "a purely uncorrectable bump must not also trigger the correctable flash"
+        );
+    }
+
+    // ── Pre-existing EVICT false-positive (found while testing the change
+    // above, not caused by it — see the FakeBackend fixture rather than a
+    // gddr_telemetry-specific one, since this bug lives entirely in the
+    // Idle/Init → Running transition's idle_power capture) ────────────────
+
+    #[test]
+    fn idle_power_baseline_uses_smoothed_ema_not_a_single_raw_sample() {
+        // Regression test for a false-EVICT bug: on the Idle/Init -> Running
+        // transition, `idle_power` was captured from one raw, unsmoothed
+        // power sample instead of the already-smoothed `power_ema` used by
+        // the other two capture sites (Dma-entry, Idle-entry). Since
+        // Blackhole's aiclk is (almost) always >=200, this transition fires
+        // on nearly every tick where power exceeds the idle floor — so any
+        // single noisy low sample sets an artificially-low baseline, and
+        // ordinary idle jitter afterward can both arm `saw_load` (exceed
+        // idle_power*1.5) and satisfy the evict condition (fall back within
+        // idle_power*1.20), evicting a device that never actually loaded.
+        //
+        // This device has a stable ~15W power_ema (settled over many prior
+        // ticks) but this tick's single raw reading is a noisy 9W dip.
+        let backend = FakeBackend::one_device(9.0, SmbusTelemetry::new());
+
+        let mut dv = DefragVis::new(120, 40);
+        let mut ds = DeviceState::new(0);
+        ds.phase = Phase::Idle;
+        ds.power_ema = 15.0;
+        dv.devices.insert(0, ds);
+
+        dv.update(&backend);
+
+        let ds = &dv.devices[&0];
+        // This assertion used to read `Phase::Running`, on the reasoning quoted
+        // in its own message: "aiclk>=200 and power(9W) > POWER_IDLE_W(8W) must
+        // enter Running". That was scaffolding for the baseline check below,
+        // and it encoded the very defect a later review reported — a chip
+        // drawing 9 W is at rest, and calling that "executing a model" is what
+        // made all four chips on an idle box read RUN. See
+        // `an_idle_blackhole_does_not_read_as_running`.
+        assert_eq!(
+            ds.phase,
+            Phase::Idle,
+            "9W is this board at rest, whatever its idle clock reads"
+        );
+        // The substance of this test, unchanged and still the thing that
+        // matters: the baseline follows the *smoothed* series, so one noisy
+        // low sample cannot pin it low and arm a false EVICT.
+        assert!(
+            ds.idle_power > 12.0,
+            "idle_power={} must track the smoothed ~14.5W baseline (power_ema \
+             after blending in the 9W sample), not the raw single 9W reading",
+            ds.idle_power
+        );
+    }
+
+    /// Companion to the test above, and the one that actually reaches the
+    /// Idle/Init → Running capture site.
+    ///
+    /// Gating Running on real load evidence moved the original test onto the
+    /// Idle path, which left that site — a hardware-verified fix — with no
+    /// coverage at all: reverting `ds.idle_power = ds.power_ema` back to the
+    /// raw `power` sample passed the entire suite. This drives a device that
+    /// genuinely enters Running while the raw reading for that tick is a noisy
+    /// low outlier, so the smoothed-vs-raw distinction is under test again.
+    #[test]
+    fn the_running_transition_baseline_also_uses_the_smoothed_ema() {
+        // Raw sample this tick is a noisy 9 W against a settled 60 W EMA, on a
+        // device with no observed rest yet (`idle_power == 0`) — the only case
+        // that still captures, and the one the original fix was written for.
+        // It enters Running on the TDP backstop.
+        let mut backend = FakeBackend::one_device(9.0, SmbusTelemetry::new());
+        backend.devices[0].limits = Some(crate::models::telemetry::DeviceLimits {
+            tdp_limit: Some(125.0),
+            ..Default::default()
+        });
+
+        let mut dv = DefragVis::new(120, 40);
+        let mut ds = DeviceState::new(0);
+        ds.phase = Phase::Idle;
+        ds.power_ema = 60.0;
+        ds.idle_power = 0.0;
+        dv.devices.insert(0, ds);
+
+        dv.update(&backend);
+
+        let ds = &dv.devices[&0];
+        assert_eq!(
+            ds.phase,
+            Phase::Running,
+            "60W of a 125W board is a real load even with no rest observed"
+        );
+        assert!(
+            ds.idle_power > 12.0,
+            "idle_power={} must come from the smoothed series, not the raw 9W \
+             outlier — a baseline pinned that low arms a false EVICT",
+            ds.idle_power
+        );
+    }
+
+    #[test]
+    fn no_gddr_telemetry_falls_back_to_byte_identical_packed_pair_behavior() {
+        // Exact pre-feature fixture: packed registers only, gddr_telemetry
+        // absent. Every field must land exactly where the old pair-decode
+        // logic would have put it.
+        let mut smbus = SmbusTelemetry::new();
+        smbus.ddr_status = Some("0x55".to_string()); // both nibbles = 5 (trained)
+        smbus.enabled_gddr = Some(0x03); // channels 0,1 enabled; rest disabled
+        smbus.gddr_corr_errs = [Some(4), None, None, None];
+
+        let backend = FakeBackend::one_device(20.0, smbus);
+        let mut dv = DefragVis::new(120, 40);
+        dv.update(&backend);
+
+        let ds = &dv.devices[&0];
+        assert!(ds.channels[0].trained, "nibble 5 decodes to trained");
+        assert!(ds.channels[0].enabled, "bit 0 set → channel 0 enabled");
+        assert!(!ds.channels[2].enabled, "bit 2 clear → channel 2 disabled");
+        assert!(
+            !ds.channels[0].bist_fail,
+            "bist_fail is always false on the fallback path"
+        );
+        assert_eq!(
+            ds.channels[0].last_corr_errs, 4,
+            "packed pair-0 corr count for channel 0"
+        );
+        assert_eq!(
+            ds.channels[0].err_flash, 11,
+            "flash set to 12, then decremented once this same frame"
+        );
+        assert_eq!(
+            ds.channels[0].last_uncorr_errs, 0,
+            "no uncorrectable signal exists in the packed registers"
+        );
     }
 }

@@ -121,6 +121,21 @@ pub struct Device {
 
     /// PCIe link width (e.g. 16), from board_info.
     pub pcie_width: Option<u8>,
+
+    /// Optional Tensix-grid override `(rows, cols)`.
+    ///
+    /// Real TT silicon leaves this `None` and the grid comes from `architecture`.
+    /// The Host/CPU backend sets it so logical CPU cores map into a star grid
+    /// (otherwise `Architecture::Unknown` yields a 0×0 grid and renders nothing).
+    #[serde(default)]
+    pub grid_override: Option<(usize, usize)>,
+
+    /// Optional memory-channel-count override.
+    ///
+    /// `None` for TT silicon (count comes from `architecture`). The Host backend
+    /// sets it to the number of synthesised DDR channels it reports.
+    #[serde(default)]
+    pub channels_override: Option<usize>,
 }
 
 impl Device {
@@ -140,6 +155,8 @@ impl Device {
             limits: None,
             pcie_speed: None,
             pcie_width: None,
+            grid_override: None,
+            channels_override: None,
         }
     }
 
@@ -148,6 +165,16 @@ impl Device {
     /// Format: "Wormhole-0" or "Grayskull-1"
     pub fn name(&self) -> String {
         format!("{}-{}", self.architecture.name(), self.index)
+    }
+
+    /// Terse device label: architecture abbreviation + index, no separator.
+    ///
+    /// Format: "BH0", "WH2", "GS1". The canonical short label used wherever a
+    /// device needs identifying in a tight space (per-device column headers,
+    /// telemetry strips) — distinct from [`Device::name`]'s longer
+    /// "Architecture-N" form, which reads better in prose.
+    pub fn short_label(&self) -> String {
+        format!("{}{}", self.architecture.abbrev(), self.index)
     }
 
     /// Check if device is Grayskull architecture
@@ -165,14 +192,22 @@ impl Device {
         self.architecture == Architecture::Blackhole
     }
 
-    /// Get number of memory channels for this device
+    /// Get number of memory channels for this device.
+    ///
+    /// Prefers `channels_override` (set by the Host backend) over the
+    /// architecture default, so CPU "devices" report a usable channel count.
     pub fn memory_channels(&self) -> usize {
-        self.architecture.memory_channels()
+        self.channels_override
+            .unwrap_or_else(|| self.architecture.memory_channels())
     }
 
-    /// Get Tensix grid dimensions for this device
+    /// Get Tensix grid dimensions `(rows, cols)` for this device.
+    ///
+    /// Prefers `grid_override` (set by the Host backend from CPU core count)
+    /// over the architecture default.
     pub fn tensix_grid(&self) -> (usize, usize) {
-        self.architecture.tensix_grid()
+        self.grid_override
+            .unwrap_or_else(|| self.architecture.tensix_grid())
     }
 }
 
@@ -237,6 +272,23 @@ mod tests {
         assert_eq!(device.name(), "Wormhole-0");
         assert!(device.is_wormhole());
         assert!(!device.is_grayskull());
+    }
+
+    #[test]
+    fn short_label_is_arch_abbrev_plus_index_no_separator() {
+        let wh = Device::new(2, "n150".to_string(), "0000:01:00.0".to_string(), "".into());
+        assert_eq!(wh.short_label(), "WH2");
+
+        let bh = Device::new(
+            0,
+            "p150a".to_string(),
+            "0000:02:00.0".to_string(),
+            "".into(),
+        );
+        assert_eq!(bh.short_label(), "BH0");
+
+        let gs = Device::new(11, "e75".to_string(), "0000:03:00.0".to_string(), "".into());
+        assert_eq!(gs.short_label(), "GS11");
     }
 
     #[test]
